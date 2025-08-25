@@ -30,7 +30,6 @@ jobs:
       - name: 集成LibWRT组件
         run: |
           cd openwrt
-          # 下载LibWRT主源码
           mkdir -p package/libwrt
           wget https://github.com/LiBwrt/openwrt-6.x/archive/refs/heads/master.zip -O libwrt.zip
           unzip -q libwrt.zip -d package/libwrt
@@ -39,65 +38,13 @@ jobs:
 
       - name: 准备ZN-M2设备树文件
         run: |
-          # 直接创建设备树文件，避免复杂的条件判断
           mkdir -p openwrt/libwrt-dts/ipq60xx
-          cat > openwrt/libwrt-dts/ipq60xx/qcom-ipq6018-zn-m2.dts << 'EOF'
-/dts-v1/;
+          # 使用printf避免EOF语法问题
+          printf '/dts-v1/;\n\n#include "qcom-ipq6018.dtsi"\n#include <dt-bindings/gpio/gpio.h>\n#include <dt-bindings/input/input.h>\n\n/ {\n    model = "ZN M2";\n    compatible = "zn,zn-m2", "qcom,ipq6018";\n\n    aliases {\n        led-boot = &led_status;\n        led-failsafe = &led_status;\n        led-running = &led_status;\n        led-upgrade = &led_status;\n    };\n\n    leds {\n        compatible = "gpio-leds";\n\n        led_status: status {\n            label = "zn-m2:blue:status";\n            gpios = <&tlmm 47 GPIO_ACTIVE_LOW>;\n            default-state = "on";\n        };\n    };\n\n    keys {\n        compatible = "gpio-keys";\n\n        reset {\n            label = "reset";\n            gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;\n            linux,code = <KEY_RESTART>;\n            debounce-interval = <60>;\n        };\n    };\n};\n\n&wifi0 {\n    status = "okay";\n};\n\n&wifi1 {\n    status = "okay";\n};\n\n&usb3 {\n    status = "okay";\n};\n' > openwrt/libwrt-dts/ipq60xx/qcom-ipq6018-zn-m2.dts
 
-#include "qcom-ipq6018.dtsi"
-#include <dt-bindings/gpio/gpio.h>
-#include <dt-bindings/input/input.h>
-
-/ {
-    model = "ZN M2";
-    compatible = "zn,zn-m2", "qcom,ipq6018";
-
-    aliases {
-        led-boot = &led_status;
-        led-failsafe = &led_status;
-        led-running = &led_status;
-        led-upgrade = &led_status;
-    };
-
-    leds {
-        compatible = "gpio-leds";
-
-        led_status: status {
-            label = "zn-m2:blue:status";
-            gpios = <&tlmm 47 GPIO_ACTIVE_LOW>;
-            default-state = "on";
-        };
-    };
-
-    keys {
-        compatible = "gpio-keys";
-
-        reset {
-            label = "reset";
-            gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;
-            linux,code = <KEY_RESTART>;
-            debounce-interval = <60>;
-        };
-    };
-};
-
-&wifi0 {
-    status = "okay";
-};
-
-&wifi1 {
-    status = "okay";
-};
-
-&usb3 {
-    status = "okay";
-};
-EOF
-
-      - name: 添加ZN-M2设备支持（适配qualcommax目录结构）
+      - name: 添加ZN-M2设备支持
         run: |
           cd openwrt
-          # 检测正确的目录结构
           if [ -d "target/linux/qualcommax/dts/qcom" ]; then
             DTS_DIR="target/linux/qualcommax/dts/qcom"
             IMAGE_MK="target/linux/qualcommax/image/generic.mk"
@@ -108,23 +55,14 @@ EOF
             TARGET="ipq60xx"
           fi
           
-          # 复制设备树文件
           mkdir -p $DTS_DIR
           cp libwrt-dts/ipq60xx/qcom-ipq6018-zn-m2.dts $DTS_DIR/
           
-          # 修改Makefile添加设备
-          cat >> $IMAGE_MK << 'EOF'
-define Device/qcom_ipq6018_zn-m2
-  $(call Device/FitImage)
-  $(call Device/UbiFit)
-  DEVICE_VENDOR := ZN
-  DEVICE_MODEL := M2
-  DEVICE_DTS := qcom-ipq6018-zn-m2
-  DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio
-  SUPPORTED_DEVICES += zn-m2
-endef
-TARGET_DEVICES += qcom_ipq6018_zn-m2
-EOF
+          # 添加设备定义
+          printf 'define Device/qcom_ipq6018_zn-m2\n  $(call Device/FitImage)\n  $(call Device/UbiFit)\n  DEVICE_VENDOR := ZN\n  DEVICE_MODEL := M2\n  DEVICE_DTS := qcom-ipq6018-zn-m2\n  DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio\n  SUPPORTED_DEVICES += zn-m2\nendef\nTARGET_DEVICES += qcom_ipq6018_zn-m2\n' >> $IMAGE_MK
+          
+          # 保存TARGET变量供后续步骤使用
+          echo "TARGET=$TARGET" >> $GITHUB_ENV
 
       - name: 配置编译选项
         run: |
@@ -161,3 +99,4 @@ EOF
         with:
           name: zn-m2-openwrt-24.10-firmware
           path: openwrt/bin/targets/*/*/*.bin
+    
