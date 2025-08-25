@@ -27,28 +27,140 @@ jobs:
           git checkout openwrt-24.10
           git pull
 
-      - name: 集成LibWRT组件 (使用正确仓库)
+      - name: 集成LibWRT组件 (修复下载错误)
         run: |
           cd openwrt
           
-          # 克隆正确的LibWRT源码仓库
+          # 使用直接zip链接下载LibWRT源码
           mkdir -p package/libwrt
-          curl -L https://api.github.com/repos/LiBwrt/openwrt-6.x/tarball | tar xz -C package/libwrt --strip-components=1
+          wget https://github.com/LiBwrt/openwrt-6.x/archive/refs/heads/master.zip -O libwrt.zip
+          unzip -q libwrt.zip -d package/libwrt
+          mv package/libwrt/*/* package/libwrt/
+          rm -f libwrt.zip
           
-          # 获取LibWRT的luci应用
+          # 下载luci-app-libwrt
           mkdir -p package/luci-app-libwrt
-          curl -L https://api.github.com/repos/libwrt/luci-app-libwrt/tarball | tar xz -C package/luci-app-libwrt --strip-components=1
+          wget https://github.com/libwrt/luci-app-libwrt/archive/refs/heads/master.zip -O luci-app-libwrt.zip
+          unzip -q luci-app-libwrt.zip -d package/luci-app-libwrt
+          mv package/luci-app-libwrt/*/* package/luci-app-libwrt/
+          rm -f luci-app-libwrt.zip
           
-          # 获取设备树文件
+          # 下载设备树文件
           mkdir -p libwrt-dts
-          curl -L https://api.github.com/repos/libwrt/device-tree-overlays/tarball | tar xz -C libwrt-dts --strip-components=1
+          wget https://github.com/libwrt/device-tree-overlays/archive/refs/heads/master.zip -O device-tree-overlays.zip
+          unzip -q device-tree-overlays.zip -d libwrt-dts
+          mv libwrt-dts/*/* libwrt-dts/
+          rm -f device-tree-overlays.zip
 
       - name: 添加ZN-M2设备支持
         run: |
           # 复制设备树文件
           cd openwrt
           mkdir -p target/linux/ipq60xx/dts/qcom/
-          cp ../libwrt-dts/ipq60xx/qcom-ipq6018-zn-m2.dts target/linux/ipq60xx/dts/qcom/
+          cp ../libwrt-dts/ipq60xx/qcom-ipq6018-zn-m2.dts target/linux/ipq60xx/dts/qcom/ || {
+            echo "设备树文件不存在，使用备用设备树"
+            # 如果找不到设备树文件，使用我们之前定义的版本
+            cat > target/linux/ipq60xx/dts/qcom/qcom-ipq6018-zn-m2.dts << 'EOF'
+            /dts-v1/;
+
+            #include "qcom-ipq6018.dtsi"
+            #include <dt-bindings/gpio/gpio.h>
+            #include <dt-bindings/input/input.h>
+
+            / {
+                model = "ZN M2";
+                compatible = "zn,zn-m2", "qcom,ipq6018";
+
+                aliases {
+                    led-boot = &led_status;
+                    led-failsafe = &led_status;
+                    led-running = &led_status;
+                    led-upgrade = &led_status;
+                };
+
+                chosen {
+                    bootargs-append = " root=/dev/ubiblock0_1";
+                };
+
+                leds {
+                    compatible = "gpio-leds";
+
+                    led_status: status {
+                        label = "zn-m2:blue:status";
+                        gpios = <&tlmm 47 GPIO_ACTIVE_LOW>;
+                        default-state = "on";
+                    };
+
+                    wlan2g {
+                        label = "zn-m2:green:wlan2g";
+                        gpios = <&tlmm 48 GPIO_ACTIVE_LOW>;
+                    };
+
+                    wlan5g {
+                        label = "zn-m2:green:wlan5g";
+                        gpios = <&tlmm 45 GPIO_ACTIVE_LOW>;
+                    };
+                };
+
+                keys {
+                    compatible = "gpio-keys";
+
+                    reset {
+                        label = "reset";
+                        gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;
+                        linux,code = <KEY_RESTART>;
+                        debounce-interval = <60>;
+                    };
+                };
+            };
+
+            &blsp1_uart3 {
+                status = "okay";
+            };
+
+            &cryptobam {
+                status = "okay";
+            };
+
+            &qpic_bam {
+                status = "okay";
+            };
+
+            &wifi0 {
+                status = "okay";
+                qcom,ath10k-calibration-variant = "ZN-M2";
+            };
+
+            &wifi1 {
+                status = "okay";
+                qcom,ath10k-calibration-variant = "ZN-M2";
+            };
+
+            &usb3 {
+                status = "okay";
+            };
+
+            &usb3_phy {
+                status = "okay";
+            };
+
+            &uartconsole {
+                status = "okay";
+            };
+
+            &prng {
+                status = "okay";
+            };
+
+            &blsp_dma {
+                status = "okay";
+            };
+
+            &watchdog {
+                status = "okay";
+            };
+            EOF
+          }
           
           # 修改Makefile添加设备
           cat >> target/linux/ipq60xx/image/generic.mk << 'EOF'
