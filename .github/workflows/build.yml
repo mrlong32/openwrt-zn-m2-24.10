@@ -27,12 +27,21 @@ jobs:
           git checkout openwrt-24.10
           git pull
 
-      - name: 集成LibWRT组件
+      - name: 集成LibWRT组件 (使用正确仓库)
         run: |
           cd openwrt
-          git clone https://github.com/libwrt/libwrt.git package/libwrt
-          git clone https://github.com/libwrt/luci-app-libwrt.git package/luci-app-libwrt
-          git clone https://github.com/libwrt/device-tree-overlays.git libwrt-dts
+          
+          # 克隆正确的LibWRT源码仓库
+          mkdir -p package/libwrt
+          curl -L https://api.github.com/repos/LiBwrt/openwrt-6.x/tarball | tar xz -C package/libwrt --strip-components=1
+          
+          # 获取LibWRT的luci应用
+          mkdir -p package/luci-app-libwrt
+          curl -L https://api.github.com/repos/libwrt/luci-app-libwrt/tarball | tar xz -C package/luci-app-libwrt --strip-components=1
+          
+          # 获取设备树文件
+          mkdir -p libwrt-dts
+          curl -L https://api.github.com/repos/libwrt/device-tree-overlays/tarball | tar xz -C libwrt-dts --strip-components=1
 
       - name: 添加ZN-M2设备支持
         run: |
@@ -91,3 +100,4 @@ jobs:
         with:
           name: zn-m2-openwrt-24.10-firmware
           path: openwrt/bin/targets/ipq60xx/generic/*.bin
+    
