@@ -1,4 +1,4 @@
-name: ZN-M2 OpenWRT 24.10 编译（libcrypt依赖修复版）
+name: ZN-M2 OpenWRT 24.10 编译（最终修复版）
 
 on:
   push:
@@ -21,9 +21,9 @@ jobs:
           path: |
             ~/.ccache
             ./openwrt
-          key: ${{ runner.os }}-openwrt-znm2-crypt-${{ github.sha }}
+          key: ${{ runner.os }}-openwrt-znm2-final-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-openwrt-znm2-crypt-
+            ${{ runner.os }}-openwrt-znm2-final-
 
       - name: 安装系统依赖
         if: steps.env-cache.outputs.cache-hit != 'true'
@@ -33,24 +33,32 @@ jobs:
             gettext git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev \
             file wget curl ccache
 
-      - name: 获取OpenWRT源码并适配依赖
+      - name: 获取OpenWRT源码并优先更新feeds（关键顺序调整）
         if: steps.env-cache.outputs.cache-hit != 'true'
         run: |
+          # 克隆源码
           git clone https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
           git checkout openwrt-24.10
+          echo "=== 当前源码分支: $(git branch --show-current)"
           
-          # 关键修复：OpenWRT 24.10中libcrypt-compat已合并到libcrypt，添加兼容处理
+          # 【核心修复】先更新feeds，再检查包（libcrypt在feeds中，不在默认源码）
+          echo "=== 优先更新并安装feeds，获取额外包 ==="
+          ./scripts/feeds update -a || { echo "feeds更新失败"; exit 1; }
+          ./scripts/feeds install -a || { echo "feeds安装失败"; exit 1; }
+          
+          # 明确安装libcrypt相关包
+          echo "=== 强制安装libcrypt包 ==="
+          ./scripts/feeds install libcrypt || { echo "libcrypt安装失败"; exit 1; }
+          
+          # 检查libcrypt包是否存在（此时feeds已更新，应该能找到）
           echo "=== 检查libcrypt包是否存在 ==="
-          if [ ! -d "package/libs/libcrypt" ]; then
-            echo "错误：未找到libcrypt包，可能需要更新feeds"
+          if [ ! -d "package/feeds/packages/libcrypt" ] && [ ! -d "package/libs/libcrypt" ]; then
+            echo "错误：仍未找到libcrypt包，列出所有可能的包路径："
+            find ./ -name "libcrypt"  # 打印调试信息，显示所有含libcrypt的路径
             exit 1
           fi
-          
-          # 更新并安装feeds，确保所有包信息最新
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          ./scripts/feeds install libcrypt  # 强制安装libcrypt（替代libcrypt-compat）
+          echo "=== libcrypt包检查通过 ==="
 
       - name: 集成LibWRT与设备树
         run: |
@@ -63,8 +71,8 @@ jobs:
             cd ../..
           fi
           
-          # 修复LibWRT中对libcrypt-compat的依赖引用（替换为libcrypt）
-          echo "=== 替换LibWRT中的libcrypt-compat依赖为libcrypt ==="
+          # 替换LibWRT中对libcrypt-compat的依赖为libcrypt
+          echo "=== 替换LibWRT中的libcrypt-compat依赖 ==="
           find package/libwrt -name "Makefile" -exec sed -i 's/libcrypt-compat/libcrypt/g' {} +
           
           # 复制设备树
@@ -93,7 +101,7 @@ jobs:
           EOF
           grep "qcom_ipq6000_m2" $IMAGE_MK || { echo "设备定义失败"; exit 1; }
 
-      - name: 配置编译目标（兼容libcrypt）
+      - name: 配置编译目标
         run: |
           cd openwrt
           rm -f .config
@@ -103,10 +111,10 @@ jobs:
           echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
           
-          # 依赖配置（用libcrypt替代libcrypt-compat）
+          # 依赖配置
           echo "CONFIG_PACKAGE_libev=y" >> .config
           echo "CONFIG_PACKAGE_lm-sensors=y" >> .config
-          echo "CONFIG_PACKAGE_libcrypt=y" >> .config  # 关键：使用libcrypt替代libcrypt-compat
+          echo "CONFIG_PACKAGE_libcrypt=y" >> .config  # 使用libcrypt
           echo "CONFIG_PACKAGE_libpam=y" >> .config
           echo "CONFIG_PACKAGE_libtirpc=y" >> .config
           echo "CONFIG_PACKAGE_glib2=y" >> .config
@@ -117,20 +125,15 @@ jobs:
           echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
           echo "CONFIG_PACKAGE_libwrt=y" >> .config
           
-          # 生成配置并验证
           make defconfig
           
-          # 详细调试输出
-          echo "=== 已配置的依赖包 ==="
-          grep "CONFIG_PACKAGE_libcrypt" .config
-          grep "CONFIG_PACKAGE_libev" .config
-          
-          echo "=== 设备配置验证 ==="
-          if ! grep -q "CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" .config; then
-            echo "设备配置失败，当前设备配置："
-            grep "CONFIG_TARGET_DEVICE_qualcommax" .config
-            exit 1
-          fi
+          # 验证配置
+          echo "=== 验证设备配置 ==="
+          grep "CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" .config \
+            || { echo "设备配置失败"; exit 1; }
+          echo "=== 验证libcrypt配置 ==="
+          grep "CONFIG_PACKAGE_libcrypt=y" .config \
+            || { echo "libcrypt未配置"; exit 1; }
 
       - name: 编译固件
         run: |
