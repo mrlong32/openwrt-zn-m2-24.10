@@ -1,0 +1,93 @@
+name: ZN-M2 OpenWRT 24.10 Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev file wget curl
+
+      - name: 获取OpenWRT 24.10源码
+        run: |
+          git clone https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          git checkout openwrt-24.10
+          git pull
+
+      - name: 集成LibWRT组件
+        run: |
+          cd openwrt
+          git clone https://github.com/libwrt/libwrt.git package/libwrt
+          git clone https://github.com/libwrt/luci-app-libwrt.git package/luci-app-libwrt
+          git clone https://github.com/libwrt/device-tree-overlays.git libwrt-dts
+
+      - name: 添加ZN-M2设备支持
+        run: |
+          # 复制设备树文件
+          cd openwrt
+          mkdir -p target/linux/ipq60xx/dts/qcom/
+          cp ../libwrt-dts/ipq60xx/qcom-ipq6018-zn-m2.dts target/linux/ipq60xx/dts/qcom/
+          
+          # 修改Makefile添加设备
+          cat >> target/linux/ipq60xx/image/generic.mk << 'EOF'
+          define Device/qcom_ipq6018_zn-m2
+            $(call Device/FitImage)
+            $(call Device/UbiFit)
+            DEVICE_VENDOR := ZN
+            DEVICE_MODEL := M2
+            DEVICE_DTS := qcom-ipq6018-zn-m2
+            DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio
+            SUPPORTED_DEVICES += zn-m2
+          endef
+          TARGET_DEVICES += qcom_ipq6018_zn-m2
+          EOF
+
+      - name: 配置编译选项
+        run: |
+          cd openwrt
+          echo 'CONFIG_TARGET_ipq60xx=y' >> .config
+          echo 'CONFIG_TARGET_ipq60xx_generic=y' >> .config
+          echo 'CONFIG_TARGET_ipq60xx_generic_DEVICE_qcom_ipq6018_zn-m2=y' >> .config
+          echo 'CONFIG_PACKAGE_luci=y' >> .config
+          echo 'CONFIG_PACKAGE_luci-ssl=y' >> .config
+          echo 'CONFIG_PACKAGE_libwrt=y' >> .config
+          echo 'CONFIG_PACKAGE_luci-app-libwrt=y' >> .config
+          echo 'CONFIG_PACKAGE_kmod-wireguard=y' >> .config
+          echo 'CONFIG_PACKAGE_wireguard-tools=y' >> .config
+
+      - name: 更新 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 下载软件包
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          find dl -size 0 -delete
+          rm -rf $(find dl -type f -name "*.sha256" -print)
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 上传编译结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: zn-m2-openwrt-24.10-firmware
+          path: openwrt/bin/targets/ipq60xx/generic/*.bin
