@@ -30,69 +30,90 @@ jobs:
       - name: 集成LibWRT组件和设备树
         run: |
           cd openwrt
-          
-          # 克隆LibWRT源码
+          # 克隆LibWRT（k6.12-nss分支，确保设备树和驱动完整）
           git clone https://github.com/LiBwrt/openwrt-6.x.git package/libwrt
           cd package/libwrt
           git checkout k6.12-nss
           cd ../..
-          
-          # 创建设备树目录
+          # 复制官方ZN-M2设备树（匹配LiBwrt路径）
           mkdir -p target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/
-          
-          # 复制官方设备树文件
           cp package/libwrt/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6000-m2.dts \
              target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/
 
       - name: 添加ZN-M2设备支持
         run: |
           cd openwrt
-          
-          # 设备配置文件路径
+          # 确认ipq60xx设备配置文件路径（OpenWRT 24.10标准路径）
           IMAGE_MK="target/linux/qualcommax/image/ipq60xx.mk"
           TARGET="qualcommax"
-          
-          # 向配置文件添加设备定义
+          # 写入设备定义（与设备树名称匹配）
           printf 'define Device/qcom_ipq6000_m2\n  $(call Device/FitImage)\n  $(call Device/UbiFit)\n  DEVICE_VENDOR := ZN\n  DEVICE_MODEL := M2\n  DEVICE_DTS := qcom/ipq6000-m2\n  DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio\n  SUPPORTED_DEVICES += ipq6000-m2\nendef\nTARGET_DEVICES += qcom_ipq6000_m2\n' >> $IMAGE_MK
-          
-          # 保存TARGET变量
+          # 保存TARGET供后续使用
           echo "TARGET=$TARGET" >> $GITHUB_ENV
 
-      - name: 配置编译选项
+      - name: 配置编译选项（补全依赖+明确目标）
         run: |
           cd openwrt
-          echo "CONFIG_TARGET_$(echo $TARGET | tr '[:lower:]' '[:upper:]')=y" >> .config
-          echo "CONFIG_TARGET_$(echo $TARGET | tr '[:lower:]' '[:upper:]')_ipq60xx=y" >> .config
-          echo "CONFIG_TARGET_$(echo $TARGET | tr '[:lower:]' '[:upper:]')_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
+          # 基础目标配置
+          echo "CONFIG_TARGET_QUALCOMMax=y" >> .config
+          echo "CONFIG_TARGET_QUALCOMMax_ipq60xx=y" >> .config
+          echo "CONFIG_TARGET_QUALCOMMax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
+          # 补全依赖（解决libcrypt-compat缺失警告）
+          echo 'CONFIG_PACKAGE_libcrypt-compat=y' >> .config
+          # 基础功能包（确保LuCI和必要驱动）
           echo 'CONFIG_PACKAGE_luci=y' >> .config
           echo 'CONFIG_PACKAGE_luci-ssl=y' >> .config
           echo 'CONFIG_PACKAGE_libwrt=y' >> .config
           echo 'CONFIG_PACKAGE_kmod-wireguard=y' >> .config
           echo 'CONFIG_PACKAGE_wireguard-tools=y' >> .config
+          # 强制生成squashfs固件（ZN-M2常用格式）
+          echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' >> .config
 
-      - name: 更新 feeds
+      - name: 同步配置（修复out of sync）
+        run: |
+          cd openwrt
+          make defconfig  # 自动对齐配置与源码，避免编译逻辑错误
+
+      - name: 更新Feeds并安装包
         run: |
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 下载软件包
+      - name: 下载依赖包（避免编译中断）
         run: |
           cd openwrt
           make download -j$(nproc)
+          # 清理空文件，防止下载失败导致的编译问题
           find dl -size 0 -delete
           rm -rf $(find dl -type f -name "*.sha256" -print)
 
-      - name: 编译固件
+      - name: 编译固件（单线程优先，便于查错）
         run: |
           cd openwrt
-          make -j$(nproc) || make -j1 V=s
+          # 先用单线程编译（减少多线程导致的隐藏错误），失败时保留详细日志
+          make -j1 V=s || { echo "编译失败，查看日志定位问题"; exit 1; }
 
-      - name: 上传编译结果
+      - name: 查看固件输出路径（关键！确认实际生成位置）
+        run: |
+          cd openwrt
+          # 打印bin目录结构，方便后续排查路径
+          echo "=== 查看bin/targets目录结构 ==="
+          find bin/targets -type d -print
+          echo "=== 查看所有生成的固件文件 ==="
+          find bin/targets -name "*.bin" -o -name "*.img" -print
+
+      - name: 上传固件（适配所有可能路径）
         uses: actions/upload-artifact@v4
         with:
           name: zn-m2-openwrt-24.10-firmware
+          # 1. 匹配qualcommax/ipq60xx路径（预期路径）
+          # 2. 匹配ipq60xx/generic路径（旧版路径兼容）
+          # 3. 匹配所有bin/img文件（防止路径遗漏）
           path: |
             openwrt/bin/targets/qualcommax/ipq60xx/*.bin
             openwrt/bin/targets/qualcommax/ipq60xx/*.img
-    
+            openwrt/bin/targets/ipq60xx/generic/*.bin
+            openwrt/bin/targets/ipq60xx/generic/*.img
+            openwrt/bin/targets/*/*/*.bin
+            openwrt/bin/targets/*/*/*.img
