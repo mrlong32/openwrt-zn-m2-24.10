@@ -30,7 +30,6 @@ jobs:
       - name: 集成LibWRT组件
         run: |
           cd openwrt
-          
           # 下载LibWRT主源码
           mkdir -p package/libwrt
           wget https://github.com/LiBwrt/openwrt-6.x/archive/refs/heads/master.zip -O libwrt.zip
@@ -162,4 +161,3 @@ EOF
         with:
           name: zn-m2-openwrt-24.10-firmware
           path: openwrt/bin/targets/*/*/*.bin
-    
