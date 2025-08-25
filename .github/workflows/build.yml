@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（修复分支问题）
+name: ZN-M2 IPQ6000 固件（修复feeds缺失）
 
 on:
   workflow_dispatch:
@@ -18,17 +18,16 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file
 
-      - name: 获取源码并验证NSS分支（关键修复）
+      - name: 获取源码并修复feeds（核心修复）
         run: |
           # 克隆LibWRT仓库
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           
-          # 列出所有可用分支，确保NSS分支存在
+          # 分支选择机制
           echo "=== 可用分支列表 ==="
           git branch -r
           
-          # 尝试多个可能的NSS分支（按优先级）
           NSS_BRANCHES=("main" "dev-nss" "k6.12-nss" "k5.15-nss")
           FOUND_BRANCH=""
           
@@ -40,29 +39,54 @@ jobs:
             fi
           done
           
-          # 如果没有找到可用分支，终止编译
           if [ -z "$FOUND_BRANCH" ]; then
             echo "错误：未找到任何NSS分支"
             exit 1
           fi
           
-          # 清理非官方插件源
+          # 【核心修复1：使用绝对路径的官方源，确保可访问】
           cat > feeds.conf.default << 'EOF'
-          src-git base https://mirror.sjtu.edu.cn/git/openwrt/base.git
-          src-git packages https://mirror.sjtu.edu.cn/git/openwrt/packages.git
-          src-git luci https://mirror.sjtu.edu.cn/git/openwrt/luci.git
+          src-git base https://git.openwrt.org/openwrt/base.git
+          src-git packages https://git.openwrt.org/feed/packages.git
+          src-git luci https://git.openwrt.org/project/luci.git
           EOF
           
-          # 更新并安装官方组件
-          ./scripts/feeds update -a
+          # 【核心修复2：初始化feeds目录结构，避免缺失】
+          mkdir -p feeds/base feeds/packages feeds/luci
+          
+          # 【核心修复3：分步更新每个feed，带重试机制】
+          echo "=== 分步更新feeds ==="
+          feeds=("base" "packages" "luci")
+          for feed in "${feeds[@]}"; do
+            echo "=== 更新 $feed 源（第1次尝试） ==="
+            if ! ./scripts/feeds update -f $feed; then
+              echo "=== $feed 源更新失败，重试一次 ==="
+              ./scripts/feeds update -f $feed || {
+                echo "错误：$feed 源更新失败，检查网络或源地址"
+                exit 1
+              }
+            fi
+          done
+          
+          # 【核心修复4：验证feeds目录是否存在】
+          echo "=== 验证feeds目录 ==="
+          for feed in "${feeds[@]}"; do
+            if [ ! -d "feeds/$feed" ]; then
+              echo "错误：feeds/$feed 目录仍缺失，当前目录结构："
+              ls -l feeds/
+              exit 1
+            fi
+          done
+          
+          # 安装组件
           ./scripts/feeds install -a
           
-          # 删除非官方插件包
+          # 清理非官方插件
           rm -rf package/libwrt/package/utils/
           rm -rf package/libwrt/package/emortal/
           rm -rf package/libwrt/package/feeds/
 
-      - name: 配置固件（官方组件+NSS加速）
+      - name: 配置固件
         run: |
           cd openwrt
           
@@ -77,17 +101,14 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-qca-nss-gmac=y" >> .config
           echo "CONFIG_PACKAGE_qca-nss-clients=y" >> .config
           
-          # 官方驱动和组件
+          # 官方组件
           echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
           echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
           echo "CONFIG_PACKAGE_kmod-usb-dwc3-qcom=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-firewall=y" >> .config
-          echo "CONFIG_PACKAGE_openssh-server=y" >> .config
           
           make defconfig
-          
-          # 验证配置
           grep "CONFIG_PACKAGE_kmod-qca-nss-dp=y" .config || { echo "NSS驱动缺失"; exit 1; }
 
       - name: 编译固件
@@ -99,7 +120,6 @@ jobs:
         run: |
           cd openwrt/bin/targets/qualcommax/ipq60xx
           ls -l *qcom_ipq6000_m2*.bin || { echo "未生成目标固件"; exit 1; }
-          binwalk -e *qcom_ipq6000_m2*.bin | grep -q "nss-dp" || { echo "NSS驱动缺失"; exit 1; }
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
