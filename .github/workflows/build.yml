@@ -12,12 +12,10 @@ jobs:
         run: |
           sudo rm -rf /etc/apt/sources.list.d/*
           sudo apt update -y
-          # 1. 补全之前缺失的依赖（libev/libpam/liblzma等）
-          # 2. 安装终端支持库（解决terminal unknown错误）
           sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev \
             file wget llvm llvm-dev lld libev-dev libpam-dev libtirpc-dev liblzma-dev libnetsnmp-dev \
-            ncurses-term  # 关键：终端类型支持库
+            ncurses-term 
 
       - name: 2. 克隆OpenWRT 24.10源码+清理残留
         run: |
@@ -25,7 +23,6 @@ jobs:
           cd openwrt
           git checkout openwrt-24.10
           git pull
-          # 彻底清理配置和编译残留（避免交互配置触发）
           make clean && make dirclean && rm -f .config .config.old
 
       - name: 3. 引入LibWRT NSS组件（仅ipq60xx）
@@ -33,12 +30,10 @@ jobs:
           cd openwrt
           mkdir -p package/libwrt-nss
           git clone -b k6.12-nss --single-branch https://github.com/LiBwrt/openwrt-6.x.git temp-nss
-          # 仅保留NSS核心驱动
           mv temp-nss/package/kernel/qca-nss-dp package/libwrt-nss/
           mv temp-nss/package/kernel/qca-nss-ecm package/libwrt-nss/
           mv temp-nss/package/kernel/qca-nss-gmac package/libwrt-nss/
           mv temp-nss/package/kernel/qca-nss-ppe package/libwrt-nss/
-          # 复制NSS补丁
           mkdir -p target/linux/qualcommax/patches-6.12/nss
           mv temp-nss/target/linux/qualcommax/patches-6.12/nss/* target/linux/qualcommax/patches-6.12/nss/
           rm -rf temp-nss
@@ -46,47 +41,34 @@ jobs:
       - name: 4. 添加ZN-M2设备（ipq60xx专属）
         run: |
           cd openwrt
-          # 创建设备树目录
           mkdir -p target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/
-          # 写设备树
           printf '/dts-v1/;\n#include "ipq6000-cmiot.dtsi"\n#include <dt-bindings/gpio/gpio.h>\n#include <dt-bindings/input/input.h>\n\n/ {\n    model = "ZN M2";\n    compatible = "zn,m2", "qcom,ipq6018";\n\n    aliases {\n        led-boot = &led_power;\n        led-failsafe = &led_power;\n        led-running = &led_power;\n        led-upgrade = &led_power;\n    };\n\n    leds {\n        compatible = "gpio-leds";\n        led_power: power {\n            label = "blue:power";\n            gpios = <&tlmm 58 GPIO_ACTIVE_HIGH>;\n        };\n    };\n\n    keys {\n        compatible = "gpio-keys";\n        reset {\n            label = "reset";\n            gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;\n            linux,code = <KEY_RESTART>;\n            debounce-interval = <60>;\n        };\n    };\n};\n\n&nss_dp {\n    status = "okay";\n    qcom,nss-dp-phy-sel = <0x0>;\n};\n\n&nss_gmac0 {\n    status = "okay";\n    label = "eth0";\n};\n\n&nss_gmac1 {\n    status = "okay";\n    label = "eth1";\n};\n\n&wifi {\n    status = "okay";\n    qcom,ath11k-calibration-variant = "ZN-M2";\n};\n\n&usb3 {\n    status = "okay";\n};\n\n&usb3_phy {\n    status = "okay";\n};\n' > target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6000-m2.dts
-
-          # 写设备定义
           printf '\n#define Device/qcom_ipq6000_m2\n  $(call Device/FitImage)\n  $(call Device/UbiFit)\n  DEVICE_VENDOR := ZN\n  DEVICE_MODEL := M2\n  DEVICE_DTS := qcom/ipq6000-m2\n  DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio kmod-ath11k-ahb \\\n                     kmod-qca-nss-dp kmod-qca-nss-ecm kmod-qca-nss-gmac kmod-qca-nss-ppe\n  SUPPORTED_DEVICES += ipq6000-m2\nendef\nTARGET_DEVICES += qcom_ipq6000_m2\n' >> target/linux/qualcommax/image/ipq60xx.mk
 
       - name: 5. 配置编译（禁用终端交互+补全依赖）
         run: |
           cd openwrt
-          # 关键1：设置终端类型（解决unknown错误）
           export TERM=linux
-          # 关键2：清空配置，避免触发menuconfig交互
           > .config
-          # 硬编码配置（无交互）
           echo 'CONFIG_TARGET_qualcommax=y' >> .config
           echo 'CONFIG_TARGET_qualcommax_ipq60xx=y' >> .config
           echo 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y' >> .config
-          # 补全依赖包（解决之前的WARNING）
-          echo 'CONFIG_PACKAGE_libev=y' >> .config    # audit依赖
-          echo 'CONFIG_PACKAGE_libpam=y' >> .config   # busybox/policycoreutils依赖
-          echo 'CONFIG_PACKAGE_libtirpc=y' >> .config # busybox依赖
-          echo 'CONFIG_PACKAGE_liblzma=y' >> .config  # kexec-tools依赖
-          echo 'CONFIG_PACKAGE_libnetsnmp=y' >> .config # lldpd依赖
-          # 基础功能
+          echo 'CONFIG_PACKAGE_libev=y' >> .config    
+          echo 'CONFIG_PACKAGE_libpam=y' >> .config   
+          echo 'CONFIG_PACKAGE_libtirpc=y' >> .config 
+          echo 'CONFIG_PACKAGE_liblzma=y' >> .config  
+          echo 'CONFIG_PACKAGE_libnetsnmp=y' >> .config 
           echo 'CONFIG_PACKAGE_luci=y' >> .config
           echo 'CONFIG_PACKAGE_luci-ssl=y' >> .config
           echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' >> .config
           echo 'CONFIG_PACKAGE_opkg=y' >> .config
           echo 'CONFIG_PACKAGE_wpad-basic-wifi=y' >> .config
-          # NSS组件
           echo 'CONFIG_PACKAGE_kmod-qca-nss-dp=y' >> .config
           echo 'CONFIG_PACKAGE_kmod-qca-nss-ecm=y' >> .config
           echo 'CONFIG_PACKAGE_kmod-qca-nss-gmac=y' >> .config
           echo 'CONFIG_PACKAGE_kmod-qca-nss-ppe=y' >> .config
           echo 'CONFIG_KERNEL_NET_NSS=y' >> .config
-          # 禁用其他架构
           echo 'CONFIG_TARGET_ath79=n' >> .config
-
-          # 关键3：用defconfig替代menuconfig（无终端交互）
           make defconfig || { echo "defconfig失败，强制生成配置"; make oldconfig < /dev/null; }
 
       - name: 6. 更新Feeds+安装包
@@ -95,7 +77,6 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           ./scripts/feeds install -p libwrt-nss -a
-          # 确保依赖包已安装
           ./scripts/feeds install libev libpam libtirpc liblzma libnetsnmp
 
       - name: 7. 下载依赖包
@@ -107,15 +88,12 @@ jobs:
       - name: 8. 编译固件（禁用终端输出干扰）
         run: |
           cd openwrt
-          # 保持终端类型，避免编译中终端错误
           export TERM=linux
-          # 单线程编译，输出详细日志
           make -j1 V=s 2>&1 | tee compile.log
 
       - name: 9. 验证固件+上传
         run: |
           cd openwrt
-          # 验证固件是否存在
           if ls bin/targets/qualcommax/ipq60xx/*.bin 1> /dev/null 2>&1; then
             echo "=== ZN-M2固件生成成功 ==="
             ls -l bin/targets/qualcommax/ipq60xx/*.bin
@@ -124,6 +102,7 @@ jobs:
             tail -100 compile.log
             exit 1
           fi
+      - name: 10. 上传 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ZN-M2_OpenWRT_24.10_ipq60xx_NSS
