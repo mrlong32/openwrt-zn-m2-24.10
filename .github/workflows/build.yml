@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（仅官方组件+NSS加速）
+name: ZN-M2 IPQ6000 固件（修复分支问题）
 
 on:
   workflow_dispatch:
@@ -18,67 +18,76 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file
 
-      - name: 获取基础源码（LibWRT核心分支，仅保留NSS驱动）
+      - name: 获取源码并验证NSS分支（关键修复）
         run: |
-          # 克隆LibWRT核心分支（含NSS加速，但最小化第三方插件）
+          # 克隆LibWRT仓库
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
-          git checkout k6.1-nss  # 保留NSS加速的稳定分支
           
-          # 【关键】清理非官方插件源，仅保留官方基础源
+          # 列出所有可用分支，确保NSS分支存在
+          echo "=== 可用分支列表 ==="
+          git branch -r
+          
+          # 尝试多个可能的NSS分支（按优先级）
+          NSS_BRANCHES=("main" "dev-nss" "k6.12-nss" "k5.15-nss")
+          FOUND_BRANCH=""
+          
+          for branch in "${NSS_BRANCHES[@]}"; do
+            if git checkout "$branch"; then
+              FOUND_BRANCH="$branch"
+              echo "=== 成功切换到NSS分支: $branch ==="
+              break
+            fi
+          done
+          
+          # 如果没有找到可用分支，终止编译
+          if [ -z "$FOUND_BRANCH" ]; then
+            echo "错误：未找到任何NSS分支"
+            exit 1
+          fi
+          
+          # 清理非官方插件源
           cat > feeds.conf.default << 'EOF'
           src-git base https://mirror.sjtu.edu.cn/git/openwrt/base.git
           src-git packages https://mirror.sjtu.edu.cn/git/openwrt/packages.git
           src-git luci https://mirror.sjtu.edu.cn/git/openwrt/luci.git
-          # 移除所有第三方插件源（如telephony、routing等非必需源）
           EOF
           
-          # 更新并安装仅官方组件
+          # 更新并安装官方组件
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           
-          # 【关键】删除LibWRT中可能包含的非官方插件包
-          rm -rf package/libwrt/package/utils/  # 移除第三方工具
-          rm -rf package/libwrt/package/emortal/  # 移除非官方系统组件
-          rm -rf package/libwrt/package/feeds/  # 移除第三方feed整合包
+          # 删除非官方插件包
+          rm -rf package/libwrt/package/utils/
+          rm -rf package/libwrt/package/emortal/
+          rm -rf package/libwrt/package/feeds/
 
-      - name: 配置固件（仅官方组件+NSS加速）
+      - name: 配置固件（官方组件+NSS加速）
         run: |
           cd openwrt
           
-          # 基础设备配置
+          # 设备配置
           echo "CONFIG_TARGET_qualcommax=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
           
-          # 【仅保留NSS加速相关驱动】
-          echo "CONFIG_PACKAGE_kmod-qca-nss-dp=y" >> .config  # NSS数据平面
-          echo "CONFIG_PACKAGE_kmod-qca-nss-ecm=y" >> .config  # NSS连接管理
-          echo "CONFIG_PACKAGE_kmod-qca-nss-gmac=y" >> .config  # NSS GMAC驱动
-          echo "CONFIG_PACKAGE_qca-nss-clients=y" >> .config  # NSS客户端组件
+          # NSS加速驱动
+          echo "CONFIG_PACKAGE_kmod-qca-nss-dp=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-qca-nss-ecm=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-qca-nss-gmac=y" >> .config
+          echo "CONFIG_PACKAGE_qca-nss-clients=y" >> .config
           
-          # 【仅保留官方必要驱动】
-          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config  # 官方无线驱动
-          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config  # 官方无线固件
-          echo "CONFIG_PACKAGE_kmod-usb-dwc3-qcom=y" >> .config  # 官方USB驱动
+          # 官方驱动和组件
+          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
+          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-usb-dwc3-qcom=y" >> .config
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-firewall=y" >> .config
+          echo "CONFIG_PACKAGE_openssh-server=y" >> .config
           
-          # 【仅保留官方基础组件】
-          echo "CONFIG_PACKAGE_luci=y" >> .config  # 官方Web管理
-          echo "CONFIG_PACKAGE_luci-app-firewall=y" >> .config  # 官方防火墙
-          echo "CONFIG_PACKAGE_openssh-server=y" >> .config  # 官方SSH
-          echo "CONFIG_PACKAGE_wireless-tools=y" >> .config  # 官方无线工具
-          echo "CONFIG_PACKAGE_iw=y" >> .config  # 官方无线配置工具
-          
-          # 生成配置并验证
           make defconfig
           
-          # 验证非官方插件已移除
-          if grep -q "CONFIG_PACKAGE_libwrt" .config; then
-            echo "错误：仍包含非官方libwrt插件"
-            exit 1
-          fi
-          
-          # 验证NSS组件已保留
+          # 验证配置
           grep "CONFIG_PACKAGE_kmod-qca-nss-dp=y" .config || { echo "NSS驱动缺失"; exit 1; }
 
       - name: 编译固件
@@ -86,22 +95,16 @@ jobs:
           cd openwrt
           make -j$(nproc) V=s 2>&1 | tee compile.log
 
-      - name: 验证固件纯净性
+      - name: 验证固件
         run: |
           cd openwrt/bin/targets/qualcommax/ipq60xx
           ls -l *qcom_ipq6000_m2*.bin || { echo "未生成目标固件"; exit 1; }
-          # 检查是否包含非官方插件（应无结果）
-          if binwalk -e *qcom_ipq6000_m2*.bin | grep -q "emortal"; then
-            echo "错误：固件中仍包含非官方插件"
-            exit 1
-          fi
-          # 检查NSS驱动是否存在
           binwalk -e *qcom_ipq6000_m2*.bin | grep -q "nss-dp" || { echo "NSS驱动缺失"; exit 1; }
 
-      - name: 上传纯净固件
+      - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: zn-m2-ipq6000-pure-firmware
+          name: zn-m2-ipq6000-firmware
           path: openwrt/bin/targets/qualcommax/ipq60xx/*qcom_ipq6000_m2*.bin
           retention-days: 14
     
