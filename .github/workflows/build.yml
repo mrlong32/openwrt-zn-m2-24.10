@@ -1,216 +1,94 @@
-name: ZN-M2 OpenWRT 24.10 Build (修复设备树路径版)
+name: 高效构建流水线
 
 on:
   push:
+    branches: [ main, develop ]
+  pull_request:
     branches: [ main ]
-  workflow_dispatch:
+
+env:
+  # 环境变量定义，便于维护
+  PROJECT_NAME: my-app
+  BUILD_DIR: ./build
+  CACHE_DIR: ~/.cache
+  DEPENDENCY_FILE: ./requirements.txt  # 依赖清单文件
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9"]  # 可扩展多版本测试
+
     steps:
-      - name: Checkout 代码仓库
+      - name: 检出代码
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-        continue-on-error: false
+          fetch-depth: 1  # 仅拉取最新提交，加快速度
 
-      - name: 安装编译依赖 (详细日志)
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          echo "=== 开始清理系统冗余包 ==="
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          
-          echo "=== 开始更新APT源 ==="
-          sudo -E apt-get -qq update || { echo "APT更新失败"; exit 1; }
-          
-          echo "=== 开始安装依赖包 ==="
-          dependencies=(
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib 
-            gettext git libncurses5-dev libssl-dev python3 python3-distutils 
-            rsync unzip zlib1g-dev file wget curl
-          )
-          for pkg in "${dependencies[@]}"; do
-            echo "正在安装: $pkg"
-            sudo -E apt-get -qq install "$pkg" || { echo "$pkg 安装失败"; exit 1; }
-          done
-          
-          echo "=== 依赖安装完成，验证关键工具版本 ==="
-          gcc --version | head -n1
-          g++ --version | head -n1
-          git --version
-          python3 --version
-
-      - name: 获取OpenWRT 24.10源码 (带校验)
-        run: |
-          echo "=== 开始克隆OpenWRT官方仓库 ==="
-          git clone https://github.com/openwrt/openwrt.git openwrt || { echo "仓库克隆失败"; exit 1; }
-          
-          echo "=== 进入源码目录并切换到24.10分支 ==="
-          cd openwrt
-          git checkout openwrt-24.10 || { echo "切换分支失败"; exit 1; }
-          
-          echo "=== 拉取最新代码 ==="
-          git pull || { echo "拉取代码失败"; exit 1; }
-          
-          echo "=== 验证当前分支 ==="
-          git branch --show-current || { echo "获取分支信息失败"; exit 1; }
-
-      - name: 集成LibWRT组件和设备树 (修复路径问题)
-        run: |
-          echo "=== 进入OpenWRT源码目录 ==="
-          cd openwrt
-          
-          echo "=== 克隆LibWRT仓库 (k6.12-nss分支) ==="
-          git clone https://github.com/LiBwrt/openwrt-6.x.git package/libwrt || { echo "克隆LibWRT失败"; exit 1; }
-          
-          echo "=== 切换到k6.12-nss分支 ==="
-          cd package/libwrt
-          git checkout k6.12-nss || { echo "切换LibWRT分支失败"; exit 1; }
-          
-          echo "=== 验证LibWRT分支 ==="
-          git branch --show-current || { echo "获取LibWRT分支信息失败"; exit 1; }
-          
-          echo "=== 搜索ZN-M2设备树实际路径 (关键修复) ==="
-          echo "在LibWRT仓库中查找ipq6000-m2.dts..."
-          DTS_FILE=$(find . -name "ipq6000-m2.dts" | head -n1)
-          
-          if [ -z "$DTS_FILE" ] || [ ! -f "$DTS_FILE" ]; then
-            echo "错误: 在LibWRT仓库中未找到ipq6000-m2.dts"
-            echo "尝试列出可能的设备树文件:"
-            find . -name "ipq6000-*.dts"
-            exit 1
-          fi
-          
-          echo "找到设备树文件: $DTS_FILE"
-          echo "设备树内容预览:"
-          head -n5 "$DTS_FILE" || true
-          
-          echo "=== 创建目标目录 ==="
-          cd ../../..  # 返回openwrt根目录
-          TARGET_DIR="target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/"
-          mkdir -p "$TARGET_DIR" || { echo "创建目标目录失败"; exit 1; }
-          
-          echo "=== 复制设备树到目标目录 ==="
-          cp "package/libwrt/$DTS_FILE" "$TARGET_DIR" || { echo "复制设备树失败"; exit 1; }
-          
-          echo "=== 验证设备树复制结果 ==="
-          if [ ! -f "$TARGET_DIR/ipq6000-m2.dts" ]; then
-            echo "错误: 设备树复制失败"
-            ls -l "$TARGET_DIR"  # 显示目标目录内容
-            exit 1
-          fi
-          echo "设备树复制成功，目标路径: $TARGET_DIR/ipq6000-m2.dts"
-
-      - name: 添加ZN-M2设备支持 (带校验)
-        run: |
-          echo "=== 进入OpenWRT源码目录 ==="
-          cd openwrt
-          
-          echo "=== 定义设备配置文件路径 ==="
-          IMAGE_MK="target/linux/qualcommax/image/ipq60xx.mk"
-          echo "设备配置文件路径: $IMAGE_MK"
-          
-          echo "=== 验证配置文件是否存在 ==="
-          if [ ! -f "$IMAGE_MK" ]; then
-            echo "错误: 配置文件 $IMAGE_MK 不存在"
-            exit 1
-          fi
-          
-          echo "=== 写入ZN-M2设备定义 ==="
-          cat << 'EOF' >> "$IMAGE_MK"
-          define Device/qcom_ipq6000_m2
-            $(call Device/FitImage)
-            $(call Device/UbiFit)
-            DEVICE_VENDOR := ZN
-            DEVICE_MODEL := M2
-            DEVICE_DTS := qcom/ipq6000-m2
-            DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio
-            SUPPORTED_DEVICES += ipq6000-m2
-          endef
-          TARGET_DEVICES += qcom_ipq6000_m2
-          EOF
-          
-          echo "=== 验证设备定义是否写入成功 ==="
-          if ! grep -q "qcom_ipq6000_m2" "$IMAGE_MK"; then
-            echo "错误: 设备定义写入失败"
-            exit 1
-          fi
-          echo "设备定义写入成功"
-          
-          echo "=== 保存目标架构信息 ==="
-          echo "TARGET=qualcommax" >> $GITHUB_ENV
-          echo "SUBTARGET=ipq60xx" >> $GITHUB_ENV
-
-      - name: 配置编译选项 (详细输出)
-        run: |
-          echo "=== 进入OpenWRT源码目录 ==="
-          cd openwrt
-          
-          echo "=== 清空现有配置 ==="
-          > .config || { echo "清空配置失败"; exit 1; }
-          
-          echo "=== 写入基础目标配置 ==="
-          echo "CONFIG_TARGET_qualcommax=y" >> .config
-          echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
-          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
-          
-          echo "=== 写入依赖包配置 ==="
-          echo 'CONFIG_PACKAGE_libcrypt-compat=y' >> .config
-          
-          echo "=== 写入功能包配置 ==="
-          echo 'CONFIG_PACKAGE_luci=y' >> .config
-          echo 'CONFIG_PACKAGE_luci-ssl=y' >> .config
-          echo 'CONFIG_PACKAGE_libwrt=y' >> .config
-          echo 'CONFIG_PACKAGE_kmod-wireguard=y' >> .config
-          echo 'CONFIG_PACKAGE_wireguard-tools=y' >> .config
-          
-          echo "=== 写入文件系统配置 ==="
-          echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' >> .config
-          
-          echo "=== 验证配置内容 ==="
-          grep "CONFIG_TARGET_qualcommax" .config
-          grep "qcom_ipq6000_m2" .config
-
-      - name: 同步配置 (详细日志)
-        run: |
-          echo "=== 进入OpenWRT源码目录 ==="
-          cd openwrt
-          make defconfig || { echo "defconfig执行失败"; exit 1; }
-          grep "CONFIG_TARGET_DEVICE_qualcommax_ipq6000_m2" .config
-
-      - name: 更新Feeds并安装包
-        run: |
-          cd openwrt
-          ./scripts/feeds update -a || { echo "Feeds更新失败"; exit 1; }
-          ./scripts/feeds install -a || { echo "Feeds安装失败"; exit 1; }
-
-      - name: 下载依赖包
-        run: |
-          cd openwrt
-          make download -j$(nproc) || { echo "依赖下载失败"; exit 1; }
-          find dl -size 0 -delete || true
-
-      - name: 编译固件
-        run: |
-          cd openwrt
-          make -j1 V=s 2>&1 | tee compile.log || { echo "编译失败"; exit 1; }
-
-      - name: 查看固件输出
-        run: |
-          cd openwrt
-          echo "=== 固件文件列表 ==="
-          find bin/targets -name "*.bin" -o -name "*.img"
-          echo "=== ZN-M2固件确认 ==="
-          find bin/targets -name "*qcom_ipq6000_m2*.bin"
-
-      - name: 上传固件和日志
-        uses: actions/upload-artifact@v4
+      - name: 缓存依赖
+        uses: actions/cache@v3
+        id: dependency-cache
         with:
-          name: zn-m2-openwrt-24.10-firmware
           path: |
-            openwrt/bin/targets/qualcommax/ipq60xx/*.bin
-            openwrt/bin/targets/qualcommax/ipq60xx/*.img
-            openwrt/compile.log
-          retention-days: 7
+            ${{ env.CACHE_DIR }}
+            ./venv
+          key: ${{ runner.os }}-deps-${{ hashFiles(env.DEPENDENCY_FILE) }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: 安装系统依赖
+        if: steps.dependency-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            && sudo rm -rf /var/lib/apt/lists/*  # 清理缓存减小镜像体积
+
+      - name: 设置Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'  # 启用pip缓存
+
+      - name: 安装项目依赖
+        if: steps.dependency-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install --upgrade pip
+          pip install -r ${{ env.DEPENDENCY_FILE }}
+          pip freeze > installed_deps.txt  # 保存实际安装的依赖版本
+
+      - name: 缓存构建产物
+        uses: actions/cache@v3
+        id: build-cache
+        with:
+          path: ${{ env.BUILD_DIR }}
+          key: ${{ runner.os }}-build-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: 编译项目
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        run: |
+          source venv/bin/activate
+          mkdir -p ${{ env.BUILD_DIR }}
+          python setup.py build --build-base ${{ env.BUILD_DIR }}
+
+      - name: 运行测试
+        run: |
+          source venv/bin/activate
+          pytest tests/ --junitxml=./test-results.xml
+
+      - name: 上传测试结果
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: ./test-results.xml
+
+      - name: 部署（仅主分支）
+        if: github.ref == 'refs/heads/main' && success()
+        run: |
+          echo "部署 ${{ env.PROJECT_NAME }} 到生产环境"
+          # 部署命令在这里
