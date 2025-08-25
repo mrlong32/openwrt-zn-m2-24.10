@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（LibWRT实际结构适配）
+name: ZN-M2 IPQ6000 固件（LibWRT分支修复版）
 
 on:
   workflow_dispatch:
@@ -18,66 +18,70 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file
 
-      - name: 基于实际源码结构适配LibWRT
+      - name: 自动适配LibWRT分支与结构
         run: |
-          # 克隆LibWRT仓库（main分支为当前活跃分支）
+          # 克隆LibWRT仓库
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           
-          # 确认分支（main分支为实际维护分支）
-          echo "=== 当前分支 ==="
-          git checkout main || git checkout master  # 兼容可能的分支命名
-          git branch
+          # 【关键修复：自动检测并使用仓库默认分支】
+          echo "=== 检测仓库默认分支 ==="
+          DEFAULT_BRANCH=$(git remote show origin | grep "HEAD branch" | cut -d ":" -f 2 | xargs)
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "无法检测默认分支，使用仓库当前HEAD"
+          else
+            echo "切换到默认分支: $DEFAULT_BRANCH"
+            git checkout "$DEFAULT_BRANCH" || {
+              echo "默认分支切换失败，使用当前分支"
+            }
+          fi
+          git branch  # 显示当前使用的分支
           
-          # 【关键修正1：Feeds配置保留原结构（不手动创建目录）】
-          # LibWRT的feeds.conf.default已包含所有必要源，仅移除冲突源
+          # 修正Feeds配置
           echo "=== 修正Feeds配置 ==="
-          sed -i '/telephony/d' feeds.conf.default  # 彻底删除telephony源
-          sed -i '/kiddin9/d' feeds.conf.default    # 彻底删除kiddin9源
+          sed -i '/telephony/d' feeds.conf.default  # 删除telephony源
+          sed -i '/kiddin9/d' feeds.conf.default    # 删除kiddin9源
           cat feeds.conf.default
           
-          # 【关键修正2：按LibWRT原生逻辑更新feeds】
-          # 不强制创建目录，使用源码自带的feeds机制
-          echo "=== 原生方式更新feeds ==="
+          # 更新feeds
+          echo "=== 更新feeds ==="
           ./scripts/feeds update -a -f || {
             echo "Feeds更新失败，重试一次"
             ./scripts/feeds update -a -f || exit 1
           }
           ./scripts/feeds install -a
           
-          # 【关键修正3：NSS驱动实际路径验证（基于源码搜索）】
-          echo "=== 搜索NSS驱动实际位置 ==="
+          # 搜索NSS驱动
+          echo "=== 搜索NSS驱动 ==="
           NSS_DRIVER_PATH=$(find package/ -name "qca-nss-dp" -type d | head -n1)
           if [ -z "$NSS_DRIVER_PATH" ]; then
-            echo "错误：未找到NSS驱动（qca-nss-dp），当前package目录结构："
-            ls -l package/  # 显示实际package目录
+            echo "错误：未找到NSS驱动，package目录结构："
+            ls -l package/
             exit 1
           fi
-          echo "=== 确认NSS驱动路径：$NSS_DRIVER_PATH ==="
+          echo "NSS驱动路径：$NSS_DRIVER_PATH"
           
-          # 【关键修正4：精准清理非官方插件（保留所有驱动）】
-          echo "=== 安全清理非必要插件 ==="
-          # 只删除明确的非官方应用插件，不碰驱动目录
-          rm -rf package/feeds/kiddin9/  # 若存在则删除
-          rm -rf package/luci-app-*  # 只删除顶层非官方LuCI插件
-          # 保留所有qca/、libwrt/、kernel/等驱动和核心目录
+          # 清理非官方插件
+          echo "=== 清理非官方插件 ==="
+          rm -rf package/feeds/kiddin9/  # 若存在
+          rm -rf package/luci-app-*  # 非官方LuCI插件
           
-          # 验证核心驱动是否保留
+          # 验证NSS驱动保留
           if [ -z "$(find package/ -name "qca-nss-*")" ]; then
             echo "错误：NSS驱动被误删"
             exit 1
           fi
 
-      - name: 配置固件（适配实际NSS驱动命名）
+      - name: 配置固件
         run: |
           cd openwrt
           
-          # 设备配置（使用LibWRT内置的IPQ6000-M2定义）
+          # 设备配置
           echo "CONFIG_TARGET_qualcommax=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
           
-          # NSS驱动（使用实际包名，基于源码搜索结果）
+          # NSS驱动配置
           echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
           echo "CONFIG_PACKAGE_qca-nss-ecm=y" >> .config
           echo "CONFIG_PACKAGE_qca-nss-gmac=y" >> .config
@@ -89,16 +93,14 @@ jobs:
           echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
           
           make defconfig
-          
-          # 验证NSS配置
           grep "qca-nss-dp=y" .config || { echo "NSS驱动未配置"; exit 1; }
 
-      - name: 编译固件（单线程确保依赖正确）
+      - name: 编译固件
         run: |
           cd openwrt
-          make -j1 V=s 2>&1 | tee compile.log  # LibWRT推荐单线程
+          make -j1 V=s 2>&1 | tee compile.log
 
-      - name: 验证固件生成
+      - name: 验证固件
         run: |
           cd openwrt/bin/targets/qualcommax/ipq60xx
           ls -l *qcom_ipq6000_m2*.bin || { echo "未生成目标固件"; exit 1; }
