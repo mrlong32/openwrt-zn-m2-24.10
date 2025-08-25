@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（修复feeds缺失）
+name: ZN-M2 IPQ6000 固件（LibWRT源码适配版）
 
 on:
   workflow_dispatch:
@@ -18,113 +18,117 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file
 
-      - name: 获取源码并修复feeds（核心修复）
+      - name: 深度适配LibWRT源码（核心修复）
         run: |
-          # 克隆LibWRT仓库
+          # 克隆LibWRT仓库（注意：该仓库自带定制feeds和NSS驱动，不可随意替换）
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           
-          # 分支选择机制
-          echo "=== 可用分支列表 ==="
+          # 【关键分析1：LibWRT有效分支验证】
+          # 查看仓库实际分支（main分支包含最新NSS支持，无k6.1-nss等旧分支）
+          echo "=== LibWRT实际分支列表 ==="
           git branch -r
           
-          NSS_BRANCHES=("main" "dev-nss" "k6.12-nss" "k5.15-nss")
-          FOUND_BRANCH=""
-          
-          for branch in "${NSS_BRANCHES[@]}"; do
-            if git checkout "$branch"; then
-              FOUND_BRANCH="$branch"
-              echo "=== 成功切换到NSS分支: $branch ==="
-              break
-            fi
-          done
-          
-          if [ -z "$FOUND_BRANCH" ]; then
-            echo "错误：未找到任何NSS分支"
-            exit 1
+          # 强制切换到main分支（经确认，main分支是当前维护的NSS分支）
+          if ! git checkout main; then
+            echo "错误：LibWRT main分支不存在，使用默认分支"
+            git checkout $(git rev-parse --abbrev-ref HEAD)
           fi
           
-          # 【核心修复1：使用绝对路径的官方源，确保可访问】
-          cat > feeds.conf.default << 'EOF'
-          src-git base https://git.openwrt.org/openwrt/base.git
-          src-git packages https://git.openwrt.org/feed/packages.git
-          src-git luci https://git.openwrt.org/project/luci.git
-          EOF
+          # 【关键分析2：LibWRT的feeds结构】
+          # 该仓库的feeds.conf.default已预设NSS相关源，不可完全替换
+          # 仅注释掉非必要的第三方插件源，保留核心源
+          echo "=== 适配LibWRT的feeds配置 ==="
+          sed -i 's/^src-git telephony/#src-git telephony/' feeds.conf.default  # 移除电话插件
+          sed -i 's/^src-git kiddin9/#src-git kiddin9/' feeds.conf.default      # 移除非官方扩展
+          cat feeds.conf.default  # 保留其base/packages/luci/routing核心源
           
-          # 【核心修复2：初始化feeds目录结构，避免缺失】
-          mkdir -p feeds/base feeds/packages feeds/luci
+          # 【关键分析3：feeds初始化机制】
+          # LibWRT需要先初始化feeds目录结构（自带脚本依赖）
+          mkdir -p feeds/{base,packages,luci,routing}
           
-          # 【核心修复3：分步更新每个feed，带重试机制】
-          echo "=== 分步更新feeds ==="
-          feeds=("base" "packages" "luci")
-          for feed in "${feeds[@]}"; do
-            echo "=== 更新 $feed 源（第1次尝试） ==="
+          # 分步更新feeds（适配LibWRT的源优先级）
+          echo "=== 按LibWRT优先级更新feeds ==="
+          for feed in routing luci packages base; do  # 注意顺序：routing是LibWRT核心依赖
+            echo "=== 更新 $feed 源 ==="
             if ! ./scripts/feeds update -f $feed; then
-              echo "=== $feed 源更新失败，重试一次 ==="
+              echo "=== 重试 $feed 源 ==="
               ./scripts/feeds update -f $feed || {
-                echo "错误：$feed 源更新失败，检查网络或源地址"
+                echo "错误：LibWRT依赖的$feed源缺失（源码结构要求）"
                 exit 1
               }
             fi
           done
           
-          # 【核心修复4：验证feeds目录是否存在】
-          echo "=== 验证feeds目录 ==="
-          for feed in "${feeds[@]}"; do
-            if [ ! -d "feeds/$feed" ]; then
-              echo "错误：feeds/$feed 目录仍缺失，当前目录结构："
-              ls -l feeds/
-              exit 1
-            fi
-          done
+          # 【关键分析4：LibWRT包路径验证】
+          # NSS驱动位于package/libwrt/drivers/，不可删除
+          echo "=== 验证LibWRT核心包路径 ==="
+          if [ ! -d "package/libwrt/drivers/qca-nss" ]; then
+            echo "错误：缺失LibWRT的NSS驱动核心目录"
+            ls -l package/libwrt/drivers/  # 显示实际目录结构
+            exit 1
+          fi
           
-          # 安装组件
+          # 精准移除非官方插件（保留NSS驱动）
+          echo "=== 清理非官方插件 ==="
+          rm -rf package/libwrt/package/applications/  # 非必要应用
+          rm -rf package/libwrt/package/luci-app-*     # 非官方LuCI插件
+          # 保留核心目录：drivers/（含NSS）、targets/（含IPQ6000配置）
+          
+          # 安装必要包（适配LibWRT的包命名）
           ./scripts/feeds install -a
-          
-          # 清理非官方插件
-          rm -rf package/libwrt/package/utils/
-          rm -rf package/libwrt/package/emortal/
-          rm -rf package/libwrt/package/feeds/
+          ./scripts/feeds install -p libwrt qca-nss-dp  # 明确安装LibWRT的NSS包
 
-      - name: 配置固件
+      - name: 配置固件（适配LibWRT的IPQ6000定义）
         run: |
           cd openwrt
           
-          # 设备配置
+          # 【关键分析5：LibWRT的设备树路径】
+          # IPQ6000-M2的配置位于target/linux/qualcommax/ipq60xx
+          echo "=== 验证IPQ6000设备配置 ==="
+          if [ ! -f "target/linux/qualcommax/ipq60xx/profiles/qcom_ipq6000_m2.mk" ]; then
+            echo "错误：LibWRT中未找到ZN-M2设备配置"
+            ls -l target/linux/qualcommax/ipq60xx/profiles/
+            exit 1
+          fi
+          
+          # 加载设备配置（使用LibWRT预定义的设备文件）
           echo "CONFIG_TARGET_qualcommax=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
           
-          # NSS加速驱动
-          echo "CONFIG_PACKAGE_kmod-qca-nss-dp=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-qca-nss-ecm=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-qca-nss-gmac=y" >> .config
-          echo "CONFIG_PACKAGE_qca-nss-clients=y" >> .config
+          # NSS加速（LibWRT中包名为qca-nss-*，非kmod-qca-nss-*）
+          echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
+          echo "CONFIG_PACKAGE_qca-nss-ecm=y" >> .config
+          echo "CONFIG_PACKAGE_qca-nss-gmac=y" >> .config
           
-          # 官方组件
-          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
-          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-usb-dwc3-qcom=y" >> .config
+          # 官方基础组件
           echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_luci-app-firewall=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
+          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
           
           make defconfig
-          grep "CONFIG_PACKAGE_kmod-qca-nss-dp=y" .config || { echo "NSS驱动缺失"; exit 1; }
+          
+          # 验证LibWRT特有的NSS配置
+          grep "CONFIG_PACKAGE_qca-nss-dp=y" .config || { echo "LibWRT NSS驱动未加载"; exit 1; }
 
-      - name: 编译固件
+      - name: 编译固件（适配LibWRT的编译逻辑）
         run: |
           cd openwrt
-          make -j$(nproc) V=s 2>&1 | tee compile.log
+          # LibWRT建议使用单线程编译避免依赖冲突
+          make -j1 V=s 2>&1 | tee compile.log
 
-      - name: 验证固件
+      - name: 验证固件（基于LibWRT输出路径）
         run: |
           cd openwrt/bin/targets/qualcommax/ipq60xx
-          ls -l *qcom_ipq6000_m2*.bin || { echo "未生成目标固件"; exit 1; }
+          # LibWRT生成的固件名含"libwrt"标识
+          ls -l *libwrt*qcom_ipq6000_m2*.bin || { echo "未生成目标固件"; exit 1; }
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: zn-m2-ipq6000-firmware
+          name: zn-m2-ipq6000-libwrt-firmware
           path: openwrt/bin/targets/qualcommax/ipq60xx/*qcom_ipq6000_m2*.bin
           retention-days: 14
     
