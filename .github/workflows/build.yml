@@ -1,90 +1,280 @@
-name: ZN-M2 OpenWRT 24.10 Build (LiBwrt官方适配版)
+name: ZN-M2 OpenWRT 24.10 Build (详细日志版)
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build_zn_m2:
+  build:
     runs-on: ubuntu-22.04
     steps:
-      - name: 1. 基础环境准备
+      - name: Checkout 代码仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+        continue-on-error: false
+
+      - name: 安装编译依赖 (详细日志)
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
+          echo "=== 开始清理系统冗余包 ==="
           sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo apt update -y && sudo apt install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses5-dev libssl-dev python3 python3-distutils \
-            rsync unzip zlib1g-dev file wget curl ccache
+          
+          echo "=== 开始更新APT源 ==="
+          sudo -E apt-get -qq update || { echo "APT更新失败"; exit 1; }
+          
+          echo "=== 开始安装依赖包 (共18个) ==="
+          dependencies=(
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib 
+            gettext git libncurses5-dev libssl-dev python3 python3-distutils 
+            rsync unzip zlib1g-dev file wget curl
+          )
+          for pkg in "${dependencies[@]}"; do
+            echo "正在安装: $pkg"
+            sudo -E apt-get -qq install "$pkg" || { echo "$pkg 安装失败"; exit 1; }
+          done
+          
+          echo "=== 依赖安装完成，验证关键工具版本 ==="
+          gcc --version | head -n1
+          g++ --version | head -n1
+          git --version
+          python3 --version
 
-      - name: 2. 克隆LiBwrt源码+验证设备树
+      - name: 获取OpenWRT 24.10源码 (带校验)
         run: |
-          git clone -b k6.12-nss --single-branch https://github.com/LiBwrt/openwrt-6.x.git openwrt
+          echo "=== 开始克隆OpenWRT官方仓库 ==="
+          git clone https://github.com/openwrt/openwrt.git openwrt || { echo "仓库克隆失败"; exit 1; }
+          
+          echo "=== 进入源码目录并切换到24.10分支 ==="
           cd openwrt
-          # 关键验证：确认ZN-M2设备树存在（不存在则报错中断）
+          git checkout openwrt-24.10 || { echo "切换分支失败"; exit 1; }
+          
+          echo "=== 拉取最新代码 ==="
+          git pull || { echo "拉取代码失败"; exit 1; }
+          
+          echo "=== 验证当前分支 ==="
+          git branch --show-current || { echo "获取分支信息失败"; exit 1; }
+          
+          echo "=== 查看源码目录结构 ==="
+          ls -la
+
+      - name: 集成LibWRT组件和设备树 (带校验)
+        run: |
+          echo "=== 进入OpenWRT源码目录 ==="
+          cd openwrt
+          
+          echo "=== 克隆LibWRT仓库 (k6.12-nss分支) ==="
+          git clone https://github.com/LiBwrt/openwrt-6.x.git package/libwrt || { echo "克隆LibWRT失败"; exit 1; }
+          
+          echo "=== 切换到k6.12-nss分支 ==="
+          cd package/libwrt
+          git checkout k6.12-nss || { echo "切换LibWRT分支失败"; exit 1; }
+          
+          echo "=== 验证LibWRT分支 ==="
+          git branch --show-current || { echo "获取LibWRT分支信息失败"; exit 1; }
+          
+          echo "=== 验证ZN-M2设备树是否存在 ==="
+          DTS_PATH="target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6000-m2.dts"
+          if [ ! -f "$DTS_PATH" ]; then
+            echo "错误: LibWRT中未找到ZN-M2设备树 ($DTS_PATH)"
+            exit 1
+          fi
+          echo "设备树存在: $DTS_PATH"
+          
+          echo "=== 复制设备树到目标目录 ==="
+          cd ../../..  # 返回openwrt根目录
+          mkdir -p target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/
+          cp "package/libwrt/$DTS_PATH" "target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/" || { echo "复制设备树失败"; exit 1; }
+          
+          echo "=== 验证设备树复制结果 ==="
           if [ ! -f "target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6000-m2.dts" ]; then
-            echo "错误：ZN-M2设备树不存在！"
+            echo "错误: 设备树复制失败"
             exit 1
           fi
-          # 关键验证：确认设备定义在ipq60xx.mk中
-          if ! grep -q "qcom_ipq6000_m2" "target/linux/qualcommax/image/ipq60xx.mk"; then
-            echo "错误：ZN-M2设备定义缺失！"
-            exit 1
-          fi
+          echo "设备树复制成功"
 
-      - name: 3. 强制锁定ZN-M2设备（核心修复）
+      - name: 添加ZN-M2设备支持 (带校验)
         run: |
+          echo "=== 进入OpenWRT源码目录 ==="
           cd openwrt
-          # 彻底清空配置，避免任何默认设备干扰
-          > .config
-          # 仅保留ZN-M2必需配置，不添加任何多余项
-          echo 'CONFIG_TARGET_qualcommax=y' >> .config
-          echo 'CONFIG_TARGET_qualcommax_ipq60xx=y' >> .config
-          echo 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y' >> .config
-          # 禁用所有其他架构（关键：阻止ath79编译）
-          echo 'CONFIG_TARGET_ath79=n' >> .config
-          echo 'CONFIG_TARGET_mediatek=n' >> .config
-          echo 'CONFIG_TARGET_bcm27xx=n' >> .config
-          # 基础功能（保持最小）
+          
+          echo "=== 定义设备配置文件路径 ==="
+          IMAGE_MK="target/linux/qualcommax/image/ipq60xx.mk"
+          echo "设备配置文件路径: $IMAGE_MK"
+          
+          echo "=== 验证配置文件是否存在 ==="
+          if [ ! -f "$IMAGE_MK" ]; then
+            echo "错误: 配置文件 $IMAGE_MK 不存在"
+            exit 1
+          fi
+          
+          echo "=== 写入ZN-M2设备定义 ==="
+          cat << 'EOF' >> "$IMAGE_MK"
+          define Device/qcom_ipq6000_m2
+            $(call Device/FitImage)
+            $(call Device/UbiFit)
+            DEVICE_VENDOR := ZN
+            DEVICE_MODEL := M2
+            DEVICE_DTS := qcom/ipq6000-m2
+            DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio
+            SUPPORTED_DEVICES += ipq6000-m2
+          endef
+          TARGET_DEVICES += qcom_ipq6000_m2
+          EOF
+          
+          echo "=== 验证设备定义是否写入成功 ==="
+          if ! grep -q "qcom_ipq6000_m2" "$IMAGE_MK"; then
+            echo "错误: 设备定义写入失败"
+            exit 1
+          fi
+          echo "设备定义写入成功"
+          
+          echo "=== 保存目标架构信息 ==="
+          echo "TARGET=qualcommax" >> $GITHUB_ENV
+          echo "SUBTARGET=ipq60xx" >> $GITHUB_ENV
+
+      - name: 配置编译选项 (详细输出)
+        run: |
+          echo "=== 进入OpenWRT源码目录 ==="
+          cd openwrt
+          
+          echo "=== 清空现有配置 ==="
+          > .config || { echo "清空配置失败"; exit 1; }
+          
+          echo "=== 写入基础目标配置 ==="
+          echo "CONFIG_TARGET_qualcommax=y" >> .config
+          echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
+          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
+          
+          echo "=== 写入依赖包配置 ==="
+          echo 'CONFIG_PACKAGE_libcrypt-compat=y' >> .config
+          
+          echo "=== 写入功能包配置 ==="
           echo 'CONFIG_PACKAGE_luci=y' >> .config
           echo 'CONFIG_PACKAGE_luci-ssl=y' >> .config
+          echo 'CONFIG_PACKAGE_libwrt=y' >> .config
+          echo 'CONFIG_PACKAGE_kmod-wireguard=y' >> .config
+          echo 'CONFIG_PACKAGE_wireguard-tools=y' >> .config
+          
+          echo "=== 写入文件系统配置 ==="
           echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' >> .config
-          # 验证配置正确性（立即发现错误）
-          if ! grep -q "qcom_ipq6000_m2" .config; then
-            echo "错误：设备配置未生效！"
-            exit 1
-          fi
-          # 生成最终配置
-          make defconfig
+          
+          echo "=== 验证配置内容 ==="
+          echo "--- 关键配置项检查 ---"
+          grep "CONFIG_TARGET_qualcommax" .config
+          grep "qcom_ipq6000_m2" .config
+          grep "CONFIG_PACKAGE_luci" .config
 
-      - name: 4. 更新Feeds+下载依赖
+      - name: 同步配置 (详细日志)
         run: |
+          echo "=== 进入OpenWRT源码目录 ==="
           cd openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          make download -j$(nproc)
-          find dl -size 0 -delete
+          
+          echo "=== 执行defconfig同步配置 ==="
+          make defconfig || { echo "defconfig执行失败"; exit 1; }
+          
+          echo "=== 验证同步后的配置 ==="
+          echo "--- 目标设备确认 ---"
+          grep "CONFIG_TARGET_DEVICE_qualcommax_ipq6000_m2" .config
+          echo "--- 架构确认 ---"
+          grep "CONFIG_TARGET_ARCH_PACKAGES" .config
 
-      - name: 5. 编译+验证输出路径
+      - name: 更新Feeds并安装包 (详细日志)
         run: |
+          echo "=== 进入OpenWRT源码目录 ==="
           cd openwrt
-          make -j1 V=s
-          # 强制验证输出目录（只允许qualcommax/ipq60xx）
-          echo "=== 固件输出目录验证 ==="
-          if [ ! -d "bin/targets/qualcommax/ipq60xx" ]; then
-            echo "错误：未生成ipq60xx目录！"
-            exit 1
-          fi
-          # 验证固件文件名（必须含ZN-M2设备名）
-          echo "=== 固件文件验证 ==="
-          ls -l bin/targets/qualcommax/ipq60xx/*.bin
-          if ! ls bin/targets/qualcommax/ipq60xx/*qcom_ipq6000_m2*.bin 1> /dev/null 2>&1; then
-            echo "错误：未生成ZN-M2固件！"
+          
+          echo "=== 更新Feeds ==="
+          ./scripts/feeds update -a || { echo "Feeds更新失败"; exit 1; }
+          
+          echo "=== 安装Feeds包 ==="
+          ./scripts/feeds install -a || { echo "Feeds安装失败"; exit 1; }
+          
+          echo "=== 验证LibWRT包是否安装 ==="
+          if ! ./scripts/feeds list | grep -q "libwrt"; then
+            echo "错误: LibWRT包未安装"
             exit 1
           fi
 
-      - name: 6. 上传ZN-M2专属固件
+      - name: 下载依赖包 (带校验)
+        run: |
+          echo "=== 进入OpenWRT源码目录 ==="
+          cd openwrt
+          
+          echo "=== 下载所有依赖包 ==="
+          make download -j$(nproc) || { echo "依赖下载失败"; exit 1; }
+          
+          echo "=== 检查空文件 ==="
+          empty_files=$(find dl -size 0 -print)
+          if [ -n "$empty_files" ]; then
+            echo "错误: 发现空文件，下载不完整:"
+            echo "$empty_files"
+            exit 1
+          fi
+          
+          echo "=== 验证关键依赖是否下载 ==="
+          echo "检查ipq60xx相关包:"
+          ls -l dl | grep "ipq60" || { echo "未找到ipq60xx相关包"; exit 1; }
+          echo "检查NSS相关包:"
+          ls -l dl | grep "nss" || { echo "未找到NSS相关包"; exit 1; }
+
+      - name: 编译固件 (详细日志)
+        run: |
+          echo "=== 进入OpenWRT源码目录 ==="
+          cd openwrt
+          
+          echo "=== 显示系统资源信息 ==="
+          free -h
+          df -h
+          nproc
+          
+          echo "=== 开始编译 (单线程) ==="
+          echo "编译开始时间: $(date)"
+          make -j1 V=s 2>&1 | tee compile.log || { echo "编译失败"; exit 1; }
+          echo "编译结束时间: $(date)"
+          
+          echo "=== 编译过程概要 ==="
+          grep -E "successfully built|error|warning" compile.log || true
+
+      - name: 详细查看固件输出 (关键验证)
+        run: |
+          echo "=== 进入OpenWRT源码目录 ==="
+          cd openwrt
+          
+          echo "=== 显示bin/targets完整目录结构 ==="
+          tree bin/targets || { echo "tree命令未安装，使用find替代"; find bin/targets; }
+          
+          echo "=== 查找所有生成的固件文件 ==="
+          firmware_files=$(find bin/targets -name "*.bin" -o -name "*.img")
+          if [ -z "$firmware_files" ]; then
+            echo "错误: 未找到任何固件文件"
+            exit 1
+          fi
+          
+          echo "=== 显示找到的固件文件信息 ==="
+          for file in $firmware_files; do
+            echo "--- $file ---"
+            ls -lh "$file"
+            file "$file"  # 显示文件类型信息
+          done
+          
+          echo "=== 验证ZN-M2固件是否存在 ==="
+          target_firmware=$(find bin/targets -name "*qcom_ipq6000_m2*.bin")
+          if [ -z "$target_firmware" ]; then
+            echo "错误: 未找到ZN-M2专属固件"
+            exit 1
+          fi
+          echo "找到ZN-M2固件: $target_firmware"
+
+      - name: 上传固件 (带详细信息)
         uses: actions/upload-artifact@v4
         with:
-          name: ZN-M2_OpenWRT_24.10_Firmware
+          name: zn-m2-openwrt-24.10-firmware-${{ github.sha }}
           path: |
-            openwrt/bin/targets/qualcommax/ipq60xx/*qcom_ipq6000_m2*.bin
-            openwrt/bin/targets/qualcommax/ipq60xx/*qcom_ipq6000_m2*.img
+            openwrt/bin/targets/qualcommax/ipq60xx/*.bin
+            openwrt/bin/targets/qualcommax/ipq60xx/*.img
+            openwrt/compile.log  # 上传编译日志方便排查问题
+          retention-days: 7
+          if-no-files-found: error
