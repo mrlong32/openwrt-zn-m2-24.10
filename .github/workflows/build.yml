@@ -1,119 +1,192 @@
-name: ZN-M2 OpenWRT 24.10 Build
+name: ZN-M2 OpenWRT 24.10 官方纯净版（含NSS加速）
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:  # 仅手动触发，避免误操作
 
 jobs:
-  build:
+  build_pure_with_nss:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: 安装编译依赖
+      - name: 1. 安装编译依赖（含NSS编译必需组件）
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo -E apt-get -qq update
-          sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev file wget curl
+          sudo rm -rf /etc/apt/sources.list.d/*
+          sudo apt update -y
+          # 官方依赖 + NSS编译必需的llvm（用于驱动编译）
+          sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3 python3-distutils rsync unzip zlib1g-dev \
+            file wget llvm llvm-dev lld
 
-      - name: 获取OpenWRT 24.10源码
+      - name: 2. 克隆 OpenWRT 24.10 官方源码
         run: |
           git clone https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
-          git checkout openwrt-24.10
+          git checkout openwrt-24.10  # 锁定官方24.10稳定分支
           git pull
 
-      - name: 集成LibWRT组件和设备树
+      - name: 3. 仅引入 LibWRT 核心 NSS 组件（无其他插件）
         run: |
           cd openwrt
-          # 克隆LibWRT（k6.12-nss分支，确保设备树和驱动完整）
-          git clone https://github.com/LiBwrt/openwrt-6.x.git package/libwrt
-          cd package/libwrt
-          git checkout k6.12-nss
-          cd ../..
-          # 复制官方ZN-M2设备树（匹配LiBwrt路径）
+          # 1. 克隆 LibWRT NSS 核心驱动（仅k6.12-nss分支的NSS相关目录，无多余文件）
+          mkdir -p package/libwrt-nss
+          git clone -b k6.12-nss --single-branch https://github.com/LiBwrt/openwrt-6.x.git temp-nss
+          # 仅保留NSS加速必需组件（驱动+内核模块，无其他插件）
+          mv temp-nss/package/kernel/qca-nss-dp package/libwrt-nss/
+          mv temp-nss/package/kernel/qca-nss-ecm package/libwrt-nss/
+          mv temp-nss/package/kernel/qca-nss-gmac package/libwrt-nss/
+          mv temp-nss/package/kernel/qca-nss-ppe package/libwrt-nss/
+          mv temp-nss/target/linux/qualcommax/patches-6.12/nss/ target/linux/qualcommax/patches-6.12/
+          rm -rf temp-nss  # 删除临时文件，减少冗余
+
+      - name: 4. 添加 ZN-M2 设备支持（含NSS硬件适配）
+        run: |
+          cd openwrt
+          # 1. 创建设备树目录（OpenWRT 24.10 官方路径）
           mkdir -p target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/
-          cp package/libwrt/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6000-m2.dts \
-             target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/
+          # 2. 写入ZN-M2设备树（适配NSS加速，仅保留基础硬件+NSS节点）
+          cat > target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq6000-m2.dts << 'EOF'
+/dts-v1/;
+#include "ipq6000-cmiot.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
 
-      - name: 添加ZN-M2设备支持
-        run: |
-          cd openwrt
-          # 确认ipq60xx设备配置文件路径（OpenWRT 24.10标准路径）
-          IMAGE_MK="target/linux/qualcommax/image/ipq60xx.mk"
-          TARGET="qualcommax"
-          # 写入设备定义（与设备树名称匹配）
-          printf 'define Device/qcom_ipq6000_m2\n  $(call Device/FitImage)\n  $(call Device/UbiFit)\n  DEVICE_VENDOR := ZN\n  DEVICE_MODEL := M2\n  DEVICE_DTS := qcom/ipq6000-m2\n  DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio\n  SUPPORTED_DEVICES += ipq6000-m2\nendef\nTARGET_DEVICES += qcom_ipq6000_m2\n' >> $IMAGE_MK
-          # 保存TARGET供后续使用
-          echo "TARGET=$TARGET" >> $GITHUB_ENV
+/ {
+    model = "ZN M2";
+    compatible = "zn,m2", "qcom,ipq6018";
 
-      - name: 配置编译选项（补全依赖+明确目标）
+    aliases {
+        led-boot = &led_power;
+        led-failsafe = &led_power;
+        led-running = &led_power;
+        led-upgrade = &led_power;
+    };
+
+    leds {
+        compatible = "gpio-leds";
+        led_power: power {
+            label = "blue:power";
+            gpios = <&tlmm 58 GPIO_ACTIVE_HIGH>;
+        };
+    };
+
+    keys {
+        compatible = "gpio-keys";
+        reset {
+            label = "reset";
+            gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_RESTART>;
+            debounce-interval = <60>;
+        };
+    };
+};
+
+// NSS加速必需节点（适配ZN-M2硬件）
+&nss_dp {
+    status = "okay";
+    qcom,nss-dp-phy-sel = <0x0>;
+};
+
+&nss_gmac0 {
+    status = "okay";
+    label = "eth0";
+};
+
+&nss_gmac1 {
+    status = "okay";
+    label = "eth1";
+};
+
+// 基础硬件（WiFi/USB）
+&wifi {
+    status = "okay";
+    qcom,ath11k-calibration-variant = "ZN-M2";
+};
+
+&usb3 {
+    status = "okay";
+};
+
+&usb3_phy {
+    status = "okay";
+};
+EOF
+
+          # 3. 添加ZN-M2设备定义（含NSS依赖包）
+          echo '
+define Device/qcom_ipq6000_m2
+  $(call Device/FitImage)
+  $(call Device/UbiFit)
+  DEVICE_VENDOR := ZN
+  DEVICE_MODEL := M2
+  DEVICE_DTS := qcom/ipq6000-m2
+  # 官方基础包 + NSS加速必需包（无其他插件）
+  DEVICE_PACKAGES := kmod-usb3 kmod-usb-dwc3-qcom kmod-leds-gpio kmod-ath11k-ahb \
+                     kmod-qca-nss-dp kmod-qca-nss-ecm kmod-qca-nss-gmac kmod-qca-nss-ppe
+  SUPPORTED_DEVICES += ipq6000-m2
+endef
+TARGET_DEVICES += qcom_ipq6000_m2
+' >> target/linux/qualcommax/image/ipq60xx.mk
+
+      - name: 5. 配置编译选项（官方纯净+NSS加速）
         run: |
           cd openwrt
           # 基础目标配置
-          echo "CONFIG_TARGET_QUALCOMMax=y" >> .config
-          echo "CONFIG_TARGET_QUALCOMMax_ipq60xx=y" >> .config
-          echo "CONFIG_TARGET_QUALCOMMax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
-          # 补全依赖（解决libcrypt-compat缺失警告）
-          echo 'CONFIG_PACKAGE_libcrypt-compat=y' >> .config
-          # 基础功能包（确保LuCI和必要驱动）
+          echo 'CONFIG_TARGET_qualcommax=y' >> .config
+          echo 'CONFIG_TARGET_qualcommax_ipq60xx=y' >> .config
+          echo 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y' >> .config
+          
+          # 官方基础功能（最小化）
           echo 'CONFIG_PACKAGE_luci=y' >> .config
           echo 'CONFIG_PACKAGE_luci-ssl=y' >> .config
-          echo 'CONFIG_PACKAGE_libwrt=y' >> .config
-          echo 'CONFIG_PACKAGE_kmod-wireguard=y' >> .config
-          echo 'CONFIG_PACKAGE_wireguard-tools=y' >> .config
-          # 强制生成squashfs固件（ZN-M2常用格式）
           echo 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' >> .config
+          echo 'CONFIG_PACKAGE_opkg=y' >> .config
+          echo 'CONFIG_PACKAGE_wpad-basic-wifi=y' >> .config
+          
+          # 启用NSS加速（仅核心组件，无多余功能）
+          echo 'CONFIG_PACKAGE_kmod-qca-nss-dp=y' >> .config  # NSS数据通路驱动
+          echo 'CONFIG_PACKAGE_kmod-qca-nss-ecm=y' >> .config  # NSS连接管理
+          echo 'CONFIG_PACKAGE_kmod-qca-nss-gmac=y' >> .config  # NSS千兆以太网控制器
+          echo 'CONFIG_PACKAGE_kmod-qca-nss-ppe=y' >> .config  # NSS包处理引擎
+          echo 'CONFIG_KERNEL_NET_NSS=y' >> .config  # 内核NSS支持
+          
+          # 禁用所有非官方/非必需功能（确保纯净）
+          echo 'CONFIG_PACKAGE_libwrt=n' >> .config
+          echo 'CONFIG_PACKAGE_luci-app-*=n' >> .config
+          echo 'CONFIG_PACKAGE_kmod-wireguard=n' >> .config
+          
+          # 同步配置（解决NSS与官方源码兼容性）
+          make defconfig
 
-      - name: 同步配置（修复out of sync）
+      - name: 6. 更新官方Feeds + NSS组件索引
         run: |
           cd openwrt
-          make defconfig  # 自动对齐配置与源码，避免编译逻辑错误
+          ./scripts/feeds update -a  # 更新官方Feeds
+          ./scripts/feeds install -a  # 安装官方基础包
+          # 手动索引NSS组件（确保编译时能识别）
+          ./scripts/feeds install -p libwrt-nss -a
 
-      - name: 更新Feeds并安装包
-        run: |
-          cd openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: 下载依赖包（避免编译中断）
+      - name: 7. 下载依赖包（含NSS驱动）
         run: |
           cd openwrt
           make download -j$(nproc)
-          # 清理空文件，防止下载失败导致的编译问题
-          find dl -size 0 -delete
+          find dl -size 0 -delete  # 清理空文件，避免下载失败
           rm -rf $(find dl -type f -name "*.sha256" -print)
 
-      - name: 编译固件（单线程优先，便于查错）
+      - name: 8. 编译固件（单线程确保NSS驱动稳定）
         run: |
           cd openwrt
-          # 先用单线程编译（减少多线程导致的隐藏错误），失败时保留详细日志
-          make -j1 V=s || { echo "编译失败，查看日志定位问题"; exit 1; }
+          make -j1 V=s  # 单线程编译，避免NSS驱动编译冲突
+          # 验证固件及NSS组件
+          echo "=== 固件生成列表（含NSS加速） ==="
+          ls -l bin/targets/qualcommax/ipq60xx/*.bin
+          echo "=== NSS驱动编译验证 ==="
+          ls -l bin/targets/qualcommax/ipq60xx/packages/kmod-qca-nss-*.ipk
 
-      - name: 查看固件输出路径（关键！确认实际生成位置）
-        run: |
-          cd openwrt
-          # 打印bin目录结构，方便后续排查路径
-          echo "=== 查看bin/targets目录结构 ==="
-          find bin/targets -type d -print
-          echo "=== 查看所有生成的固件文件 ==="
-          find bin/targets -name "*.bin" -o -name "*.img" -print
-
-      - name: 上传固件（适配所有可能路径）
+      - name: 9. 上传含NSS加速的官方纯净固件
         uses: actions/upload-artifact@v4
         with:
-          name: zn-m2-openwrt-24.10-firmware
-          # 1. 匹配qualcommax/ipq60xx路径（预期路径）
-          # 2. 匹配ipq60xx/generic路径（旧版路径兼容）
-          # 3. 匹配所有bin/img文件（防止路径遗漏）
+          name: ZN-M2_OpenWRT_24.10_Official_NSS
           path: |
-            openwrt/bin/targets/qualcommax/ipq60xx/*.bin
-            openwrt/bin/targets/qualcommax/ipq60xx/*.img
-            openwrt/bin/targets/ipq60xx/generic/*.bin
-            openwrt/bin/targets/ipq60xx/generic/*.img
-            openwrt/bin/targets/*/*/*.bin
-            openwrt/bin/targets/*/*/*.img
+            openwrt/bin/targets/qualcommax/ipq60xx/openwrt-qualcommax-ipq60xx-qcom_ipq6000_m2-squashfs-factory.bin
+            openwrt/bin/targets/qualcommax/ipq60xx/openwrt-qualcommax-ipq60xx-qcom_ipq6000_m2-squashfs-sysupgrade.bin
