@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（动态检测硬件支持）
+name: ZN-M2 IPQ6000 固件（全分支自动扫描）
 
 on:
   workflow_dispatch:
@@ -18,118 +18,110 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 克隆源码并验证IPQ6000支持（核心修复）
+      - name: 克隆源码并自动扫描所有分支
         run: |
-          # 克隆LibWRT仓库
+          # 克隆仓库并获取所有分支信息
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           
-          # 明确使用已知可能支持IPQ6000的分支（经社区反馈k5.15-nss可能支持）
-          echo "=== 尝试切换到可能支持IPQ6000的分支 ==="
-          SUPPORTED_BRANCHES=("k5.15-nss" "main" "dev-nss")
-          FOUND_SUPPORT_BRANCH=""
+          # 拉取所有远程分支信息（关键：确保本地能看到所有分支）
+          git fetch --all
           
-          for branch in "${SUPPORTED_BRANCHES[@]}"; do
+          # 列出仓库所有可用分支（远程+本地）
+          echo "=== 仓库所有可用分支 ==="
+          git branch -a
+          
+          # 提取所有远程分支名称（排除HEAD和master/main别名）
+          ALL_BRANCHES=$(git branch -r | grep -v "HEAD" | sed 's/origin\///' | sort -u)
+          
+          if [ -z "$ALL_BRANCHES" ]; then
+            echo "错误：仓库中未找到任何分支"
+            exit 1
+          fi
+          
+          # 筛选可能支持IPQ6000/NSS的分支（含nss、ipq6000、6.x等关键词）
+          echo "=== 筛选可能支持IPQ6000的分支 ==="
+          CANDIDATE_BRANCHES=$(echo "$ALL_BRANCHES" | grep -E "nss|ipq60|6\.[0-9]+|qualcomm|m2" | sort -u)
+          
+          if [ -z "$CANDIDATE_BRANCHES" ]; then
+            echo "警告：未找到疑似支持IPQ6000的分支，尝试所有分支"
+            CANDIDATE_BRANCHES="$ALL_BRANCHES"
+          fi
+          
+          echo "=== 候选分支列表 ==="
+          echo "$CANDIDATE_BRANCHES"
+          
+          # 尝试切换候选分支，直到找到可用分支
+          FOUND_BRANCH=""
+          for branch in $CANDIDATE_BRANCHES; do
             if git checkout "$branch"; then
-              echo "=== 切换到分支: $branch ==="
-              FOUND_SUPPORT_BRANCH="$branch"
+              echo "=== 成功切换到分支: $branch ==="
+              FOUND_BRANCH="$branch"
               break
             fi
           done
           
-          if [ -z "$FOUND_SUPPORT_BRANCH" ]; then
-            echo "错误：所有候选分支均无法切换"
+          if [ -z "$FOUND_BRANCH" ]; then
+            echo "错误：所有分支均无法切换"
             exit 1
           fi
           
-          # 【关键修复：动态搜索IPQ60xx配置，不依赖固定目录】
-          echo "=== 全局搜索IPQ60xx相关配置文件 ==="
+          # 动态搜索IPQ60xx配置
+          echo "=== 搜索IPQ60xx配置目录 ==="
           IPQ60XX_CONFIGS=$(find target/linux/ -name "ipq60xx" -type d)
-          
           if [ -z "$IPQ60XX_CONFIGS" ]; then
-            echo "错误：当前分支完全不支持IPQ60xx芯片！"
-            echo "分支$FOUND_SUPPORT_BRANCH的target/linux目录结构："
+            echo "错误：分支$FOUND_BRANCH不支持IPQ60xx"
             ls -l target/linux/
             exit 1
           fi
+          echo "=== 找到IPQ60xx配置：$IPQ60XX_CONFIGS ==="
           
-          echo "=== 找到IPQ60xx相关配置目录：$IPQ60XX_CONFIGS ==="
-          
-          # 处理feeds（保持与分支兼容）
+          # 处理feeds
           sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
           ./scripts/feeds update -a -f || { ./scripts/feeds update -a -f || exit 1; }
           ./scripts/feeds install -a
 
-      - name: 配置固件（基于实际找到的配置）
+      - name: 配置固件（动态适配）
         run: |
           cd openwrt
-          
-          # 从找到的IPQ60xx目录中提取平台信息（如qualcommax）
           PLATFORM_DIR=$(dirname "$IPQ60XX_CONFIGS" | xargs basename)
-          echo "=== 检测到IPQ60xx所属平台：$PLATFORM_DIR ==="
+          echo "=== 平台目录：$PLATFORM_DIR ==="
           
-          # 动态生成设备配置（不假设固定设备名）
           echo "CONFIG_TARGET_$PLATFORM_DIR=y" >> .config
           echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx=y" >> .config
-          
-          # 尝试所有可能的M2设备名（宽松匹配）
-          echo "=== 尝试所有可能的M2设备配置 ==="
-          for device in "qcom_ipq6000_m2" "zn_m2" "ipq6000_zn_m2" "m2_ipq6000"; do
+          for device in "qcom_ipq6000_m2" "zn_m2" "ipq6000-zn-m2"; do
             echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx_DEVICE_$device=y" >> .config
           done
           
-          # 核心功能配置
+          # 核心功能
           echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
-          echo "CONFIG_PACKAGE_qca-nss-ecm=y" >> .config
           echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
-          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
-          
-          # 依赖解决
           echo "CONFIG_PACKAGE_boost-system=y" >> .config
-          echo "CONFIG_PACKAGE_libpam=y" >> .config
-          echo "CONFIG_PACKAGE_liblzma=y" >> .config
           
           make defconfig
-          
-          # 验证是否有设备被启用
-          echo "=== 实际启用的设备配置 ==="
-          grep "CONFIG_TARGET_DEVICE_${PLATFORM_DIR}_ipq60xx_DEVICE" .config || {
-            echo "错误：未启用任何IPQ60xx设备"
-            exit 1
-          }
+          grep "CONFIG_TARGET_DEVICE_${PLATFORM_DIR}_ipq60xx_DEVICE" .config || exit 1
 
-      - name: 编译固件（带错误捕获）
+      - name: 编译固件
         run: |
           cd openwrt
-          if ! make -j1 V=s 2>&1 | tee compile.log; then
-            echo "=== 编译错误最后100行 ==="
-            tail -n 100 compile.log
-            exit 1
-          fi
+          make -j1 V=s 2>&1 | tee compile.log || { tail -n 100 compile.log; exit 1; }
 
-      - name: 全局搜索固件（不依赖路径）
+      - name: 搜索固件
         run: |
           cd openwrt
-          # 从bin目录全局搜索IPQ6000相关固件
-          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000" | grep -i "m2" | head -n1)
-          
+          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000.*m2" | head -n1)
           if [ -z "$FIRMWARE_FILE" ]; then
-            echo "=== 未找到固件，bin目录所有文件 ==="
-            find bin/ -name "*.bin"
-            exit 1
+            find bin/ -name "*.bin"; exit 1
           fi
-          
-          echo "=== 找到固件：$FIRMWARE_FILE ==="
-          # 复制到易于访问的路径
-          cp "$FIRMWARE_FILE" ./zn-m2-ipq6000-firmware.bin
+          cp "$FIRMWARE_FILE" ./zn-m2-firmware.bin
 
-      - name: 上传固件和日志
+      - name: 上传结果
         uses: actions/upload-artifact@v4
         with:
-          name: zn-m2-ipq6000-final
+          name: zn-m2-ipq6000-firmware
           path: |
-            openwrt/zn-m2-ipq6000-firmware.bin
+            openwrt/zn-m2-firmware.bin
             openwrt/compile.log
           retention-days: 14
     
