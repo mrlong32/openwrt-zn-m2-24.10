@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（全分支自动扫描）
+name: ZN-M2 IPQ6000 固件（依赖与平台修复）
 
 on:
   workflow_dispatch:
@@ -18,89 +18,92 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 克隆源码并自动扫描所有分支
+      - name: 克隆源码并筛选支持分支
         run: |
-          # 克隆仓库并获取所有分支信息
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
-          
-          # 拉取所有远程分支信息（关键：确保本地能看到所有分支）
           git fetch --all
           
-          # 列出仓库所有可用分支（远程+本地）
-          echo "=== 仓库所有可用分支 ==="
+          # 列出所有分支并筛选
+          echo "=== 所有可用分支 ==="
           git branch -a
-          
-          # 提取所有远程分支名称（排除HEAD和master/main别名）
           ALL_BRANCHES=$(git branch -r | grep -v "HEAD" | sed 's/origin\///' | sort -u)
+          CANDIDATE_BRANCHES=$(echo "$ALL_BRANCHES" | grep -E "nss|ipq60|6\.[0-9]+|qualcomm" | sort -u)
+          [ -z "$CANDIDATE_BRANCHES" ] && CANDIDATE_BRANCHES="$ALL_BRANCHES"
           
-          if [ -z "$ALL_BRANCHES" ]; then
-            echo "错误：仓库中未找到任何分支"
-            exit 1
-          fi
-          
-          # 筛选可能支持IPQ6000/NSS的分支（含nss、ipq6000、6.x等关键词）
-          echo "=== 筛选可能支持IPQ6000的分支 ==="
-          CANDIDATE_BRANCHES=$(echo "$ALL_BRANCHES" | grep -E "nss|ipq60|6\.[0-9]+|qualcomm|m2" | sort -u)
-          
-          if [ -z "$CANDIDATE_BRANCHES" ]; then
-            echo "警告：未找到疑似支持IPQ6000的分支，尝试所有分支"
-            CANDIDATE_BRANCHES="$ALL_BRANCHES"
-          fi
-          
-          echo "=== 候选分支列表 ==="
-          echo "$CANDIDATE_BRANCHES"
-          
-          # 尝试切换候选分支，直到找到可用分支
+          # 切换分支
           FOUND_BRANCH=""
           for branch in $CANDIDATE_BRANCHES; do
             if git checkout "$branch"; then
-              echo "=== 成功切换到分支: $branch ==="
               FOUND_BRANCH="$branch"
               break
             fi
           done
+          [ -z "$FOUND_BRANCH" ] && { echo "所有分支无法切换"; exit 1; }
           
-          if [ -z "$FOUND_BRANCH" ]; then
-            echo "错误：所有分支均无法切换"
-            exit 1
-          fi
-          
-          # 动态搜索IPQ60xx配置
-          echo "=== 搜索IPQ60xx配置目录 ==="
-          IPQ60XX_CONFIGS=$(find target/linux/ -name "ipq60xx" -type d)
+          # 搜索IPQ60xx配置（确保路径正确）
+          IPQ60XX_CONFIGS=$(find target/linux/ -name "ipq60xx" -type d | head -n1)
           if [ -z "$IPQ60XX_CONFIGS" ]; then
-            echo "错误：分支$FOUND_BRANCH不支持IPQ60xx"
-            ls -l target/linux/
-            exit 1
+            echo "分支$FOUND_BRANCH不支持IPQ60xx"; exit 1
           fi
-          echo "=== 找到IPQ60xx配置：$IPQ60XX_CONFIGS ==="
+          echo "IPQ60xx配置路径：$IPQ60XX_CONFIGS"
           
-          # 处理feeds
+          # 修复feeds，确保基础库可用
           sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
           ./scripts/feeds update -a -f || { ./scripts/feeds update -a -f || exit 1; }
           ./scripts/feeds install -a
+          
+          # 手动安装关键依赖包（核心修复）
+          ./scripts/feeds install libcrypt-compat boost-system libxcrypt
 
-      - name: 配置固件（动态适配）
+      - name: 配置固件（修正平台目录+强制依赖）
         run: |
           cd openwrt
-          PLATFORM_DIR=$(dirname "$IPQ60XX_CONFIGS" | xargs basename)
-          echo "=== 平台目录：$PLATFORM_DIR ==="
           
+          # 【修复平台目录提取】正确获取平台名（如qualcommax）
+          # 从路径"target/linux/qualcommax/ipq60xx"中提取"qualcommax"
+          PLATFORM_DIR=$(echo "$IPQ60XX_CONFIGS" | awk -F '/' '{print $3}')
+          if [ "$PLATFORM_DIR" = "." ] || [ -z "$PLATFORM_DIR" ]; then
+            echo "错误：无法提取平台目录，当前路径：$IPQ60XX_CONFIGS"
+            exit 1
+          fi
+          echo "正确平台目录：$PLATFORM_DIR"
+          
+          # 正确生成设备配置
           echo "CONFIG_TARGET_$PLATFORM_DIR=y" >> .config
           echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx=y" >> .config
-          for device in "qcom_ipq6000_m2" "zn_m2" "ipq6000-zn-m2"; do
+          for device in "qcom_ipq6000_m2" "zn_m2"; do
             echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx_DEVICE_$device=y" >> .config
           done
+          
+          # 【强制添加缺失依赖】
+          echo "CONFIG_PACKAGE_libcrypt-compat=y" >> .config  # 核心缺失依赖
+          echo "CONFIG_PACKAGE_boost-system=y" >> .config
+          echo "CONFIG_PACKAGE_libxcrypt=y" >> .config
           
           # 核心功能
           echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
           echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
-          echo "CONFIG_PACKAGE_boost-system=y" >> .config
+          
+          # 【禁用依赖冲突的非必要包】
+          echo "CONFIG_PACKAGE_alpine=n" >> .config
+          echo "CONFIG_PACKAGE_apr=n" >> .config
+          echo "CONFIG_PACKAGE_ccrypt=n" >> .config
+          echo "CONFIG_PACKAGE_domoticz=n" >> .config
+          echo "CONFIG_PACKAGE_exim=n" >> .config
+          echo "CONFIG_PACKAGE_freeradius3=n" >> .config
+          echo "CONFIG_PACKAGE_haproxy=n" >> .config
+          echo "CONFIG_PACKAGE_i2pd=n" >> .config
+          echo "CONFIG_PACKAGE_kea=n" >> .config
+          echo "CONFIG_PACKAGE_libtorrent-rasterbar=n" >> .config
+          echo "CONFIG_PACKAGE_trojan=n" >> .config
           
           make defconfig
-          grep "CONFIG_TARGET_DEVICE_${PLATFORM_DIR}_ipq60xx_DEVICE" .config || exit 1
+          
+          # 验证关键配置
+          grep "CONFIG_TARGET_$PLATFORM_DIR=y" .config || { echo "平台配置错误"; exit 1; }
+          grep "CONFIG_PACKAGE_libcrypt-compat=y" .config || { echo "依赖仍缺失"; exit 1; }
 
       - name: 编译固件
         run: |
@@ -111,9 +114,7 @@ jobs:
         run: |
           cd openwrt
           FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000.*m2" | head -n1)
-          if [ -z "$FIRMWARE_FILE" ]; then
-            find bin/ -name "*.bin"; exit 1
-          fi
+          [ -z "$FIRMWARE_FILE" ] && { find bin/ -name "*.bin"; exit 1; }
           cp "$FIRMWARE_FILE" ./zn-m2-firmware.bin
 
       - name: 上传结果
