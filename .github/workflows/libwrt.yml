@@ -1,5 +1,4 @@
-name: 直接生成ZN-M2固件（LibWRT）
-
+name: 手动添加ZN-M2设备定义（LibWRT）
 on:
   workflow_dispatch:
 
@@ -12,78 +11,173 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 安装基础依赖
+      - name: 安装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git wget unzip gcc g++ make \
+          sudo apt-get install -y \
+            build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 克隆LibWRT源码并切换到默认分支
+      - name: 克隆源码并切换分支
         run: |
-          # 直接克隆仓库并使用默认分支（k6.12-nss）
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
-          git checkout k6.12-nss  # 明确使用仓库默认分支
-          echo "当前使用分支: $(git rev-parse --abbrev-ref HEAD)"
+          git checkout k6.12-nss  # 确认使用默认分支
+          echo "当前分支: $(git rev-parse --abbrev-ref HEAD)"
 
-      - name: 配置Feeds和基础依赖
+      - name: 手动添加 ZN-M2 设备配置（核心修复）
         run: |
           cd openwrt
-          # 简化Feeds配置，只保留必要源
+          # 目标路径：IPQ60xx 平台的设备配置目录
+          DEVICE_PROFILE_DIR="target/linux/qualcommax/ipq60xx/profiles"
+          DEVICE_DTS_DIR="target/linux/qualcommax/ipq60xx/files/arch/arm64/boot/dts/qcom"
+          
+          # 1. 创建设备配置目录（若不存在）
+          mkdir -p $DEVICE_PROFILE_DIR $DEVICE_DTS_DIR
+          
+          # 2. 手动添加 ZN-M2 设备树（基于 IPQ6000 通用 DTS 修改）
+          # 注：此 DTS 为 ZN-M2 通用配置，适配 IPQ6000+QCN9074 无线
+          cat > $DEVICE_DTS_DIR/qcom-ipq6000-zn-m2.dts << 'EOF'
+// ZN-M2 设备树（IPQ6000 + 2x2 5G + 2x2 2.4G + 4 网口）
+/dts-v1/;
+#include "ipq6018.dtsi"
+
+/ {
+    model = "ZN-M2 (IPQ6000)";
+    compatible = "qcom,ipq6000-zn-m2", "qcom,ipq6000";
+
+    memory {
+        device_type = "memory";
+        reg = <0x80000000 0x20000000>; // 512MB RAM
+    };
+
+    aliases {
+        serial0 = &blsp1_uart3;
+        led-boot = &led_status;
+        led-failsafe = &led_status;
+        led-running = &led_status;
+        led-upgrade = &led_status;
+    };
+
+    leds {
+        compatible = "gpio-leds";
+        led_status: status {
+            label = "znm2:blue:status";
+            gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
+        };
+    };
+
+    keys {
+        compatible = "gpio-keys";
+        reset {
+            label = "reset";
+            gpios = <&tlmm 63 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_RESTART>;
+        };
+    };
+};
+
+&blsp1_uart3 {
+    status = "okay";
+};
+
+&wifi0 {
+    status = "okay";
+    qcom,ath11k-calibration-variant = "QCN9074";
+};
+
+&wifi1 {
+    status = "okay";
+    qcom,ath11k-calibration-variant = "QCN9074";
+};
+
+&mdio {
+    status = "okay";
+    ethphy0: ethernet-phy@0 {
+        reg = <0>;
+    };
+};
+
+&gmac0 {
+    status = "okay";
+    phy-mode = "rgmii-rxid";
+    phy-handle = <&ethphy0>;
+};
+EOF
+          
+          # 3. 手动添加 ZN-M2 设备编译配置
+          cat > $DEVICE_PROFILE_DIR/qcom_ipq6000_zn_m2.mk << 'EOF'
+# ZN-M2 设备配置
+define Device/qcom_ipq6000_zn_m2
+  $(call Device/FitImage)
+  $(call Device/Default-arm64)
+  DEVICE_VENDOR := ZN
+  DEVICE_MODEL := M2
+  DEVICE_DTS := qcom-ipq6000-zn-m2
+  DEVICE_PACKAGES := kmod-ath11k ath11k-firmware-qcn9074 \
+                     kmod-qca-nss-dp kmod-qca-nss-ecm luci
+  IMAGE_SIZE := 16384k
+  SUPPORTED_DEVICES := qcom,ipq6000-zn-m2
+endef
+TARGET_DEVICES += qcom_ipq6000_zn_m2
+EOF
+          
+          # 4. 验证设备配置是否添加成功
+          echo "=== 验证 ZN-M2 设备配置 ==="
+          ls -l $DEVICE_PROFILE_DIR/qcom_ipq6000_zn_m2.mk || { echo "设备配置创建失败"; exit 1; }
+          ls -l $DEVICE_DTS_DIR/qcom-ipq6000-zn-m2.dts || { echo "设备树创建失败"; exit 1; }
+
+      - name: 配置 Feeds 和依赖
+        run: |
+          cd openwrt
           sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
           ./scripts/feeds update -a -f
           ./scripts/feeds install -a
-          # 强制安装缺失的核心依赖
-          ./scripts/feeds install libcrypt-compat boost-system libxcrypt luci
+          ./scripts/feeds install libcrypt-compat boost-system libxcrypt
 
-      - name: 直接指定ZN-M2（IPQ6000）配置
+      - name: 启用 ZN-M2 设备编译
         run: |
           cd openwrt
-          # 手动指定IPQ6000平台和ZN-M2设备（基于常规命名）
+          # 启用 IPQ60xx 平台和 ZN-M2 设备
           echo "CONFIG_TARGET_qualcommax=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
-          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
+          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_zn_m2=y" >> .config
           
           # 启用核心功能
-          echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config  # NSS加速
-          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config  # 无线驱动
-          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config  # 无线固件
-          echo "CONFIG_PACKAGE_luci=y" >> .config  # Web界面
-          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config  # 中文支持
+          echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
+          echo "CONFIG_PACKAGE_luci=y" >> .config
           
-          # 解决依赖警告
-          echo "CONFIG_PACKAGE_libcrypt-compat=y" >> .config
-          echo "CONFIG_PACKAGE_boost-system=y" >> .config
-          
-          # 生成配置
           make defconfig
+          
+          # 验证 ZN-M2 设备是否被启用
+          grep "CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_zn_m2=y" .config || { echo "ZN-M2 设备未启用"; exit 1; }
 
-      - name: 编译固件
+      - name: 编译 ZN-M2 固件
         run: |
           cd openwrt
-          # 单线程编译，确保错误可追踪
           make -j1 V=s 2>&1 | tee compile.log
 
-      - name: 提取固件（宽松匹配）
+      - name: 提取 ZN-M2 固件
         run: |
           cd openwrt
-          # 搜索所有可能的固件文件（不严格限制名称）
-          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000" | head -n1)
+          # 搜索 ZN-M2 相关固件
+          FIRMWARE_FILE=$(find bin/targets/qualcommax/ipq60xx/ -name "*qcom-ipq6000-zn-m2*.bin")
+          
           if [ -n "$FIRMWARE_FILE" ]; then
-            cp "$FIRMWARE_FILE" ./zn-m2-firmware.bin
-            echo "找到固件: $(basename $FIRMWARE_FILE)"
+              cp "$FIRMWARE_FILE" ./zn-m2-final-firmware.bin
+              echo "ZN-M2固件生成成功: $(basename $FIRMWARE_FILE)"
           else
-            echo "未找到固件，输出所有bin文件:"
-            find bin/ -name "*.bin"
-            exit 1
+              echo "=== 固件生成失败，输出 IPQ60xx 目录所有文件 ==="
+              ls -l bin/targets/qualcommax/ipq60xx/
+              exit 1
           fi
 
-      - name: 上传固件和日志
+      - name: 上传 ZN-M2 固件
         uses: actions/upload-artifact@v4
         with:
-          name: zn-m2-final-firmware
+          name: zn-m2-ipq6000-firmware
           path: |
-            openwrt/zn-m2-firmware.bin
+            openwrt/zn-m2-final-firmware.bin
             openwrt/compile.log
           retention-days: 14
-    
