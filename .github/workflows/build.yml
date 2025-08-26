@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（路径解析修复版）
+name: ZN-M2 IPQ6000 固件（分支筛选修复）
 
 on:
   workflow_dispatch:
@@ -18,24 +18,45 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 分支扫描与配置路径验证
+      - name: 精准筛选IPQ6000相关分支（核心修复）
         run: |
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           git fetch --all
           
-          echo "=== 所有可用分支 ==="
+          echo "=== 仓库所有分支 ==="
           git branch -a
-          ALL_BRANCHES=$(git branch -r | grep -v "HEAD" | sed 's/origin\///' | sort -u)
           
+          # 【关键修复：只保留与IPQ6000相关的分支，排除IPQ50xx等无关分支】
+          ALL_BRANCHES=$(git branch -r | grep -v "HEAD" | sed 's/origin\///' | sort -u)
+          echo "=== 原始分支列表 ==="
+          echo "$ALL_BRANCHES"
+          
+          # 筛选逻辑：
+          # 1. 保留含"ipq60"（直接关联IPQ6000）
+          # 2. 保留含"nss"（可能包含IPQ6000的NSS驱动）
+          # 3. 排除含"ipq50"（明确无关的芯片）
+          CANDIDATE_BRANCHES=$(echo "$ALL_BRANCHES" | \
+            grep -E "ipq60|nss" | \
+            grep -v "ipq50" | \
+            sort -u)
+          
+          # 兜底：如果筛选后为空，尝试默认分支（k6.12-nss）
+          if [ -z "$CANDIDATE_BRANCHES" ]; then
+            echo "=== 未找到明确关联IPQ6000的分支，尝试默认分支k6.12-nss ==="
+            CANDIDATE_BRANCHES="k6.12-nss"
+          fi
+          
+          echo "=== 筛选后尝试的IPQ6000相关分支 ==="
+          echo "$CANDIDATE_BRANCHES"
+          
+          # 尝试切换筛选后的分支
           FOUND_VALID_BRANCH=""
           FOUND_CONFIG_PATH=""
-          
-          # 逐个分支查找有效配置
-          for branch in $ALL_BRANCHES; do
-            echo -e "\n=== 尝试分支: $branch ==="
+          for branch in $CANDIDATE_BRANCHES; do
+            echo -e "\n=== 尝试分支: $branch（IPQ6000相关候选） ==="
             if git checkout "$branch"; then
-              # 搜索IPQ6000相关目录（放宽匹配条件）
+              # 搜索IPQ6000配置
               CONFIG_PATHS=$(find target/linux/ -type d | grep -i "ipq6000")
               
               if [ -n "$CONFIG_PATHS" ]; then
@@ -51,13 +72,13 @@ jobs:
             fi
           done
           
-          # 验证找到有效路径
+          # 最终验证
           if [ -z "$FOUND_VALID_BRANCH" ] || [ -z "$FOUND_CONFIG_PATH" ]; then
-            echo -e "\n===== 所有分支均不支持IPQ6000 ====="
+            echo -e "\n===== 所有相关分支均不支持IPQ6000 ====="
             exit 1
           fi
           
-          echo -e "\n=== 确认分支：$FOUND_VALID_BRANCH ==="
+          echo -e "\n=== 确认使用分支：$FOUND_VALID_BRANCH ==="
           echo "=== 确认配置路径：$FOUND_CONFIG_PATH ==="
           
           # 处理feeds
@@ -66,71 +87,43 @@ jobs:
           ./scripts/feeds install -a
           ./scripts/feeds install libcrypt-compat boost-system libxcrypt
 
-      - name: 配置固件（增强路径解析）
+      - name: 配置固件（基于有效路径）
         run: |
           cd openwrt
           
-          # 【核心修复：增强路径解析】
-          echo "=== 解析配置路径：$FOUND_CONFIG_PATH ==="
-          
-          # 将路径按"/"分割为数组（处理任意深度）
+          # 路径解析（增强容错）
           IFS='/' read -ra PATH_PARTS <<< "$FOUND_CONFIG_PATH"
+          echo "=== 路径拆分：${PATH_PARTS[@]} ==="
           
-          # 打印路径拆分结果（辅助调试）
-          echo "=== 路径拆分结果（索引: 值） ==="
-          for i in "${!PATH_PARTS[@]}"; do
-            echo "$i: ${PATH_PARTS[$i]}"
-          done
-          
-          # 提取平台目录（target/linux/[平台]/... → 取第3个元素，索引为2）
-          # 容错：如果索引2不存在，尝试索引1（应对可能的路径缩写）
           PLATFORM_DIR=""
-          if [ ${#PATH_PARTS[@]} -ge 3 ] && [ -n "${PATH_PARTS[2]}" ]; then
+          if [ ${#PATH_PARTS[@]} -ge 3 ]; then
             PLATFORM_DIR="${PATH_PARTS[2]}"
-          elif [ ${#PATH_PARTS[@]} -ge 2 ] && [ -n "${PATH_PARTS[1]}" ]; then
+          elif [ ${#PATH_PARTS[@]} -ge 2 ]; then
             PLATFORM_DIR="${PATH_PARTS[1]}"
-            echo "警告：路径结构异常，使用备用索引提取平台目录"
           fi
           
-          # 提取设备基础名（路径最后一段）
-          DEVICE_BASE="${PATH_PARTS[-1]}"  # 取数组最后一个元素
+          DEVICE_BASE="${PATH_PARTS[-1]}"
           
-          # 严格验证提取结果
           if [ -z "$PLATFORM_DIR" ] || [ -z "$DEVICE_BASE" ]; then
-            echo -e "\n===== 路径解析失败 ====="
-            echo "平台目录：'$PLATFORM_DIR'（应为qualcomm/qualcommax等）"
-            echo "设备基础名：'$DEVICE_BASE'（应为ipq6000等）"
+            echo "路径解析失败：平台='$PLATFORM_DIR'，设备='$DEVICE_BASE'"
             exit 1
           fi
           
-          echo -e "\n=== 提取结果：平台='$PLATFORM_DIR'，设备='$DEVICE_BASE' ==="
-          
-          # 生成配置（完全基于提取结果）
+          # 生成配置
           echo "CONFIG_TARGET_$PLATFORM_DIR=y" >> .config
           echo "CONFIG_TARGET_${PLATFORM_DIR}_$DEVICE_BASE=y" >> .config
-          
-          # 尝试可能的设备变种
-          for device in "zn_m2" "qcom_ipq6000_m2" "m2" "zn-m2"; do
+          for device in "zn_m2" "qcom_ipq6000_m2"; do
             echo "CONFIG_TARGET_${PLATFORM_DIR}_${DEVICE_BASE}_DEVICE_$device=y" >> .config
           done
           
-          # 依赖与功能配置
+          # 依赖与功能
           echo "CONFIG_PACKAGE_libcrypt-compat=y" >> .config
           echo "CONFIG_PACKAGE_boost-system=y" >> .config
           echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
-          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
           
-          # 禁用冲突包
-          echo "CONFIG_PACKAGE_alpine=n" >> .config
-          echo "CONFIG_PACKAGE_apr=n" >> .config
-          
           make defconfig
-          
-          # 验证配置
-          grep "CONFIG_TARGET_${PLATFORM_DIR}_${DEVICE_BASE}=y" .config || {
-            echo "设备配置无效"; exit 1;
-          }
+          grep "CONFIG_TARGET_${PLATFORM_DIR}_${DEVICE_BASE}=y" .config || exit 1
 
       - name: 编译固件
         run: |
@@ -140,7 +133,7 @@ jobs:
       - name: 搜索固件
         run: |
           cd openwrt
-          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -iE "ipq6000.*m2" | head -n1)
+          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000.*m2" | head -n1)
           [ -z "$FIRMWARE_FILE" ] && { find bin/ -name "*.bin"; exit 1; }
           cp "$FIRMWARE_FILE" ./zn-m2-firmware.bin
 
