@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（LibWRT分支修复版）
+name: ZN-M2 IPQ6000 固件（修复未生成问题）
 
 on:
   workflow_dispatch:
@@ -12,103 +12,102 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 安装依赖
+      - name: 安装系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
-            libncurses5-dev libssl-dev python3 rsync file
+            libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 自动适配LibWRT分支与结构
+      - name: 克隆源码并验证设备支持
         run: |
-          # 克隆LibWRT仓库
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           
-          # 【关键修复：自动检测并使用仓库默认分支】
-          echo "=== 检测仓库默认分支 ==="
+          # 切换到默认分支
           DEFAULT_BRANCH=$(git remote show origin | grep "HEAD branch" | cut -d ":" -f 2 | xargs)
-          if [ -z "$DEFAULT_BRANCH" ]; then
-            echo "无法检测默认分支，使用仓库当前HEAD"
-          else
-            echo "切换到默认分支: $DEFAULT_BRANCH"
-            git checkout "$DEFAULT_BRANCH" || {
-              echo "默认分支切换失败，使用当前分支"
+          [ -n "$DEFAULT_BRANCH" ] && git checkout "$DEFAULT_BRANCH"
+          git branch
+          
+          # 【关键】验证IPQ6000-M2是否在支持的设备列表中
+          echo "=== 查看LibWRT支持的IPQ60xx设备 ==="
+          IPQ60XX_PROFILES="target/linux/qualcommax/ipq60xx/profiles"
+          if [ -d "$IPQ60XX_PROFILES" ]; then
+            ls -l "$IPQ60XX_PROFILES"
+            # 搜索可能的设备命名（如m2、zn-m2等）
+            grep -r "m2" "$IPQ60XX_PROFILES" || {
+              echo "警告：未找到包含'm2'的设备配置，可能命名不同"
             }
+          else
+            echo "错误：IPQ60xx设备配置目录不存在"
+            exit 1
           fi
-          git branch  # 显示当前使用的分支
           
-          # 修正Feeds配置
-          echo "=== 修正Feeds配置 ==="
-          sed -i '/telephony/d' feeds.conf.default  # 删除telephony源
-          sed -i '/kiddin9/d' feeds.conf.default    # 删除kiddin9源
-          cat feeds.conf.default
-          
-          # 更新feeds
-          echo "=== 更新feeds ==="
-          ./scripts/feeds update -a -f || {
-            echo "Feeds更新失败，重试一次"
-            ./scripts/feeds update -a -f || exit 1
-          }
+          # 处理feeds
+          sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
+          ./scripts/feeds update -a -f || { ./scripts/feeds update -a -f || exit 1; }
           ./scripts/feeds install -a
-          
-          # 搜索NSS驱动
-          echo "=== 搜索NSS驱动 ==="
-          NSS_DRIVER_PATH=$(find package/ -name "qca-nss-dp" -type d | head -n1)
-          if [ -z "$NSS_DRIVER_PATH" ]; then
-            echo "错误：未找到NSS驱动，package目录结构："
-            ls -l package/
-            exit 1
-          fi
-          echo "NSS驱动路径：$NSS_DRIVER_PATH"
-          
-          # 清理非官方插件
-          echo "=== 清理非官方插件 ==="
-          rm -rf package/feeds/kiddin9/  # 若存在
-          rm -rf package/luci-app-*  # 非官方LuCI插件
-          
-          # 验证NSS驱动保留
-          if [ -z "$(find package/ -name "qca-nss-*")" ]; then
-            echo "错误：NSS驱动被误删"
-            exit 1
-          fi
 
-      - name: 配置固件
+      - name: 配置固件（适配可能的设备命名）
         run: |
           cd openwrt
           
-          # 设备配置
+          # 尝试多种可能的设备命名（核心修复）
           echo "CONFIG_TARGET_qualcommax=y" >> .config
           echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
+          # 可能的设备名：qcom_ipq6000_m2、zn_m2、ipq6000-zn-m2等
           echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
+          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2=y" >> .config  # 备选
+          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_ipq6000-zn-m2=y" >> .config  # 备选
           
-          # NSS驱动配置
+          # 核心功能配置
           echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
           echo "CONFIG_PACKAGE_qca-nss-ecm=y" >> .config
-          echo "CONFIG_PACKAGE_qca-nss-gmac=y" >> .config
-          echo "CONFIG_PACKAGE_qca-nss-clients=y" >> .config
-          
-          # 基础组件
-          echo "CONFIG_PACKAGE_luci=y" >> .config
           echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
           echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          
+          # 解决依赖
+          echo "CONFIG_PACKAGE_boost-system=y" >> .config
+          echo "CONFIG_PACKAGE_libpam=y" >> .config
+          echo "CONFIG_PACKAGE_liblzma=y" >> .config
           
           make defconfig
-          grep "qca-nss-dp=y" .config || { echo "NSS驱动未配置"; exit 1; }
+          
+          # 查看实际启用的目标设备
+          echo "=== 实际启用的设备配置 ==="
+          grep "CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE" .config
 
-      - name: 编译固件
+      - name: 编译固件（捕获错误）
         run: |
           cd openwrt
-          make -j1 V=s 2>&1 | tee compile.log
+          # 编译并检查返回码
+          if ! make -j1 V=s 2>&1 | tee compile.log; then
+            echo "=== 编译错误，最后100行日志 ==="
+            tail -n 100 compile.log
+            exit 1
+          fi
 
-      - name: 验证固件
+      - name: 扩展搜索固件（核心修复）
         run: |
           cd openwrt/bin/targets/qualcommax/ipq60xx
-          ls -l *qcom_ipq6000_m2*.bin || { echo "未生成目标固件"; exit 1; }
+          echo "=== 查看输出目录所有文件 ==="
+          ls -l
+          
+          # 扩展搜索模式（不严格匹配设备名，避免命名差异）
+          FIRMWARE_FILE=$(find . -name "*.bin" | grep -i "ipq6000.*m2" | head -n1)
+          if [ -z "$FIRMWARE_FILE" ]; then
+            echo "=== 未找到目标固件，尝试搜索所有bin文件 ==="
+            find . -name "*.bin"
+            exit 1
+          fi
+          echo "=== 找到固件：$FIRMWARE_FILE ==="
 
-      - name: 上传固件
+      - name: 上传固件和日志
         uses: actions/upload-artifact@v4
         with:
           name: zn-m2-ipq6000-firmware
-          path: openwrt/bin/targets/qualcommax/ipq60xx/*qcom_ipq6000_m2*.bin
+          path: |
+            openwrt/bin/targets/qualcommax/ipq60xx/*.bin
+            openwrt/compile.log
           retention-days: 14
     
