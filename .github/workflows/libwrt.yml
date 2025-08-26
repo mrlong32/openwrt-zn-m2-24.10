@@ -1,0 +1,89 @@
+name: 直接生成ZN-M2固件（LibWRT）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-znm2:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装基础依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git wget unzip gcc g++ make \
+            libncurses5-dev libssl-dev python3 rsync file ccache
+
+      - name: 克隆LibWRT源码并切换到默认分支
+        run: |
+          # 直接克隆仓库并使用默认分支（k6.12-nss）
+          git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
+          cd openwrt
+          git checkout k6.12-nss  # 明确使用仓库默认分支
+          echo "当前使用分支: $(git rev-parse --abbrev-ref HEAD)"
+
+      - name: 配置Feeds和基础依赖
+        run: |
+          cd openwrt
+          # 简化Feeds配置，只保留必要源
+          sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
+          ./scripts/feeds update -a -f
+          ./scripts/feeds install -a
+          # 强制安装缺失的核心依赖
+          ./scripts/feeds install libcrypt-compat boost-system libxcrypt luci
+
+      - name: 直接指定ZN-M2（IPQ6000）配置
+        run: |
+          cd openwrt
+          # 手动指定IPQ6000平台和ZN-M2设备（基于常规命名）
+          echo "CONFIG_TARGET_qualcommax=y" >> .config
+          echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
+          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
+          
+          # 启用核心功能
+          echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config  # NSS加速
+          echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config  # 无线驱动
+          echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config  # 无线固件
+          echo "CONFIG_PACKAGE_luci=y" >> .config  # Web界面
+          echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config  # 中文支持
+          
+          # 解决依赖警告
+          echo "CONFIG_PACKAGE_libcrypt-compat=y" >> .config
+          echo "CONFIG_PACKAGE_boost-system=y" >> .config
+          
+          # 生成配置
+          make defconfig
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          # 单线程编译，确保错误可追踪
+          make -j1 V=s 2>&1 | tee compile.log
+
+      - name: 提取固件（宽松匹配）
+        run: |
+          cd openwrt
+          # 搜索所有可能的固件文件（不严格限制名称）
+          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000" | head -n1)
+          if [ -n "$FIRMWARE_FILE" ]; then
+            cp "$FIRMWARE_FILE" ./zn-m2-firmware.bin
+            echo "找到固件: $(basename $FIRMWARE_FILE)"
+          else
+            echo "未找到固件，输出所有bin文件:"
+            find bin/ -name "*.bin"
+            exit 1
+          fi
+
+      - name: 上传固件和日志
+        uses: actions/upload-artifact@v4
+        with:
+          name: zn-m2-final-firmware
+          path: |
+            openwrt/zn-m2-firmware.bin
+            openwrt/compile.log
+          retention-days: 14
+    
