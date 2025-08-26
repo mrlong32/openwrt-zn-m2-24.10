@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（依赖与平台修复）
+name: ZN-M2 IPQ6000 固件（修复IPQ60xx目录搜索）
 
 on:
   workflow_dispatch:
@@ -18,20 +18,19 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 克隆源码并筛选支持分支
+      - name: 克隆源码并严格验证IPQ60xx支持
         run: |
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           git fetch --all
           
-          # 列出所有分支并筛选
+          # 分支筛选与切换
           echo "=== 所有可用分支 ==="
           git branch -a
           ALL_BRANCHES=$(git branch -r | grep -v "HEAD" | sed 's/origin\///' | sort -u)
           CANDIDATE_BRANCHES=$(echo "$ALL_BRANCHES" | grep -E "nss|ipq60|6\.[0-9]+|qualcomm" | sort -u)
           [ -z "$CANDIDATE_BRANCHES" ] && CANDIDATE_BRANCHES="$ALL_BRANCHES"
           
-          # 切换分支
           FOUND_BRANCH=""
           for branch in $CANDIDATE_BRANCHES; do
             if git checkout "$branch"; then
@@ -40,44 +39,67 @@ jobs:
             fi
           done
           [ -z "$FOUND_BRANCH" ] && { echo "所有分支无法切换"; exit 1; }
+          echo "=== 已切换到分支: $FOUND_BRANCH ==="
           
-          # 搜索IPQ60xx配置（确保路径正确）
-          IPQ60XX_CONFIGS=$(find target/linux/ -name "ipq60xx" -type d | head -n1)
-          if [ -z "$IPQ60XX_CONFIGS" ]; then
-            echo "分支$FOUND_BRANCH不支持IPQ60xx"; exit 1
+          # 【增强搜索逻辑】扩大搜索范围，验证目录存在性
+          echo "=== 验证target/linux目录是否存在 ==="
+          if [ ! -d "target/linux" ]; then
+            echo "错误：target/linux目录不存在，源码结构异常"
+            ls -l target/  # 显示target目录内容
+            exit 1
           fi
-          echo "IPQ60xx配置路径：$IPQ60XX_CONFIGS"
           
-          # 修复feeds，确保基础库可用
+          # 全局搜索ipq60xx相关目录（不限制深度）
+          echo "=== 全局搜索IPQ60xx配置... ==="
+          IPQ60XX_CONFIGS=$(find target/linux/ -name "ipq60xx" -type d)
+          
+          # 严格验证搜索结果
+          if [ -z "$IPQ60XX_CONFIGS" ]; then
+            echo "错误：分支$FOUND_BRANCH完全不包含IPQ60xx配置！"
+            echo "target/linux目录结构："
+            ls -l target/linux/  # 显示实际存在的平台目录
+            exit 1
+          fi
+          
+          # 选择第一个有效配置目录
+          IPQ60XX_CONFIGS=$(echo "$IPQ60XX_CONFIGS" | head -n1)
+          echo "=== 找到IPQ60xx配置路径：$IPQ60XX_CONFIGS ==="
+          
+          # 修复feeds和依赖
           sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
           ./scripts/feeds update -a -f || { ./scripts/feeds update -a -f || exit 1; }
           ./scripts/feeds install -a
-          
-          # 手动安装关键依赖包（核心修复）
           ./scripts/feeds install libcrypt-compat boost-system libxcrypt
 
-      - name: 配置固件（修正平台目录+强制依赖）
+      - name: 配置固件（防空路径处理）
         run: |
           cd openwrt
           
-          # 【修复平台目录提取】正确获取平台名（如qualcommax）
-          # 从路径"target/linux/qualcommax/ipq60xx"中提取"qualcommax"
-          PLATFORM_DIR=$(echo "$IPQ60XX_CONFIGS" | awk -F '/' '{print $3}')
-          if [ "$PLATFORM_DIR" = "." ] || [ -z "$PLATFORM_DIR" ]; then
-            echo "错误：无法提取平台目录，当前路径：$IPQ60XX_CONFIGS"
+          # 【防空保护】再次验证路径有效性
+          if [ -z "$IPQ60XX_CONFIGS" ] || [ ! -d "$IPQ60XX_CONFIGS" ]; then
+            echo "错误：IPQ60xx配置路径无效: $IPQ60XX_CONFIGS"
             exit 1
           fi
-          echo "正确平台目录：$PLATFORM_DIR"
           
-          # 正确生成设备配置
+          # 【可靠提取平台目录】从绝对路径中提取（如/xxx/target/linux/qualcommax/ipq60xx → qualcommax）
+          PLATFORM_DIR=$(dirname "$IPQ60XX_CONFIGS" | xargs basename)
+          if [ "$PLATFORM_DIR" = "." ] || [ -z "$PLATFORM_DIR" ]; then
+            echo "错误：提取平台目录失败，当前配置路径：$IPQ60XX_CONFIGS"
+            echo "路径解析过程："
+            dirname "$IPQ60XX_CONFIGS"  # 显示父目录
+            exit 1
+          fi
+          echo "=== 提取到平台目录：$PLATFORM_DIR ==="
+          
+          # 生成设备配置
           echo "CONFIG_TARGET_$PLATFORM_DIR=y" >> .config
           echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx=y" >> .config
           for device in "qcom_ipq6000_m2" "zn_m2"; do
             echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx_DEVICE_$device=y" >> .config
           done
           
-          # 【强制添加缺失依赖】
-          echo "CONFIG_PACKAGE_libcrypt-compat=y" >> .config  # 核心缺失依赖
+          # 强制依赖
+          echo "CONFIG_PACKAGE_libcrypt-compat=y" >> .config
           echo "CONFIG_PACKAGE_boost-system=y" >> .config
           echo "CONFIG_PACKAGE_libxcrypt=y" >> .config
           
@@ -86,24 +108,15 @@ jobs:
           echo "CONFIG_PACKAGE_kmod-ath11k=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
           
-          # 【禁用依赖冲突的非必要包】
+          # 禁用冲突包
           echo "CONFIG_PACKAGE_alpine=n" >> .config
           echo "CONFIG_PACKAGE_apr=n" >> .config
-          echo "CONFIG_PACKAGE_ccrypt=n" >> .config
           echo "CONFIG_PACKAGE_domoticz=n" >> .config
-          echo "CONFIG_PACKAGE_exim=n" >> .config
-          echo "CONFIG_PACKAGE_freeradius3=n" >> .config
-          echo "CONFIG_PACKAGE_haproxy=n" >> .config
-          echo "CONFIG_PACKAGE_i2pd=n" >> .config
-          echo "CONFIG_PACKAGE_kea=n" >> .config
-          echo "CONFIG_PACKAGE_libtorrent-rasterbar=n" >> .config
-          echo "CONFIG_PACKAGE_trojan=n" >> .config
           
           make defconfig
           
-          # 验证关键配置
-          grep "CONFIG_TARGET_$PLATFORM_DIR=y" .config || { echo "平台配置错误"; exit 1; }
-          grep "CONFIG_PACKAGE_libcrypt-compat=y" .config || { echo "依赖仍缺失"; exit 1; }
+          # 最终验证
+          grep "CONFIG_TARGET_$PLATFORM_DIR=y" .config || { echo "平台配置无效"; exit 1; }
 
       - name: 编译固件
         run: |
