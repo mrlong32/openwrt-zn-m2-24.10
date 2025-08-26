@@ -1,4 +1,4 @@
-name: ZN-M2 IPQ6000 固件（修复未生成问题）
+name: ZN-M2 IPQ6000 固件（动态检测硬件支持）
 
 on:
   workflow_dispatch:
@@ -18,46 +18,65 @@ jobs:
           sudo apt-get install -y build-essential git wget unzip gcc g++ make \
             libncurses5-dev libssl-dev python3 rsync file ccache
 
-      - name: 克隆源码并验证设备支持
+      - name: 克隆源码并验证IPQ6000支持（核心修复）
         run: |
+          # 克隆LibWRT仓库
           git clone https://github.com/LiBwrt/openwrt-6.x.git openwrt
           cd openwrt
           
-          # 切换到默认分支
-          DEFAULT_BRANCH=$(git remote show origin | grep "HEAD branch" | cut -d ":" -f 2 | xargs)
-          [ -n "$DEFAULT_BRANCH" ] && git checkout "$DEFAULT_BRANCH"
-          git branch
+          # 明确使用已知可能支持IPQ6000的分支（经社区反馈k5.15-nss可能支持）
+          echo "=== 尝试切换到可能支持IPQ6000的分支 ==="
+          SUPPORTED_BRANCHES=("k5.15-nss" "main" "dev-nss")
+          FOUND_SUPPORT_BRANCH=""
           
-          # 【关键】验证IPQ6000-M2是否在支持的设备列表中
-          echo "=== 查看LibWRT支持的IPQ60xx设备 ==="
-          IPQ60XX_PROFILES="target/linux/qualcommax/ipq60xx/profiles"
-          if [ -d "$IPQ60XX_PROFILES" ]; then
-            ls -l "$IPQ60XX_PROFILES"
-            # 搜索可能的设备命名（如m2、zn-m2等）
-            grep -r "m2" "$IPQ60XX_PROFILES" || {
-              echo "警告：未找到包含'm2'的设备配置，可能命名不同"
-            }
-          else
-            echo "错误：IPQ60xx设备配置目录不存在"
+          for branch in "${SUPPORTED_BRANCHES[@]}"; do
+            if git checkout "$branch"; then
+              echo "=== 切换到分支: $branch ==="
+              FOUND_SUPPORT_BRANCH="$branch"
+              break
+            fi
+          done
+          
+          if [ -z "$FOUND_SUPPORT_BRANCH" ]; then
+            echo "错误：所有候选分支均无法切换"
             exit 1
           fi
           
-          # 处理feeds
+          # 【关键修复：动态搜索IPQ60xx配置，不依赖固定目录】
+          echo "=== 全局搜索IPQ60xx相关配置文件 ==="
+          IPQ60XX_CONFIGS=$(find target/linux/ -name "ipq60xx" -type d)
+          
+          if [ -z "$IPQ60XX_CONFIGS" ]; then
+            echo "错误：当前分支完全不支持IPQ60xx芯片！"
+            echo "分支$FOUND_SUPPORT_BRANCH的target/linux目录结构："
+            ls -l target/linux/
+            exit 1
+          fi
+          
+          echo "=== 找到IPQ60xx相关配置目录：$IPQ60XX_CONFIGS ==="
+          
+          # 处理feeds（保持与分支兼容）
           sed -i '/telephony/d; /kiddin9/d' feeds.conf.default
           ./scripts/feeds update -a -f || { ./scripts/feeds update -a -f || exit 1; }
           ./scripts/feeds install -a
 
-      - name: 配置固件（适配可能的设备命名）
+      - name: 配置固件（基于实际找到的配置）
         run: |
           cd openwrt
           
-          # 尝试多种可能的设备命名（核心修复）
-          echo "CONFIG_TARGET_qualcommax=y" >> .config
-          echo "CONFIG_TARGET_qualcommax_ipq60xx=y" >> .config
-          # 可能的设备名：qcom_ipq6000_m2、zn_m2、ipq6000-zn-m2等
-          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_qcom_ipq6000_m2=y" >> .config
-          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_zn_m2=y" >> .config  # 备选
-          echo "CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_ipq6000-zn-m2=y" >> .config  # 备选
+          # 从找到的IPQ60xx目录中提取平台信息（如qualcommax）
+          PLATFORM_DIR=$(dirname "$IPQ60XX_CONFIGS" | xargs basename)
+          echo "=== 检测到IPQ60xx所属平台：$PLATFORM_DIR ==="
+          
+          # 动态生成设备配置（不假设固定设备名）
+          echo "CONFIG_TARGET_$PLATFORM_DIR=y" >> .config
+          echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx=y" >> .config
+          
+          # 尝试所有可能的M2设备名（宽松匹配）
+          echo "=== 尝试所有可能的M2设备配置 ==="
+          for device in "qcom_ipq6000_m2" "zn_m2" "ipq6000_zn_m2" "m2_ipq6000"; do
+            echo "CONFIG_TARGET_${PLATFORM_DIR}_ipq60xx_DEVICE_$device=y" >> .config
+          done
           
           # 核心功能配置
           echo "CONFIG_PACKAGE_qca-nss-dp=y" >> .config
@@ -66,48 +85,51 @@ jobs:
           echo "CONFIG_PACKAGE_ath11k-firmware-qcn9074=y" >> .config
           echo "CONFIG_PACKAGE_luci=y" >> .config
           
-          # 解决依赖
+          # 依赖解决
           echo "CONFIG_PACKAGE_boost-system=y" >> .config
           echo "CONFIG_PACKAGE_libpam=y" >> .config
           echo "CONFIG_PACKAGE_liblzma=y" >> .config
           
           make defconfig
           
-          # 查看实际启用的目标设备
+          # 验证是否有设备被启用
           echo "=== 实际启用的设备配置 ==="
-          grep "CONFIG_TARGET_DEVICE_qualcommax_ipq60xx_DEVICE" .config
+          grep "CONFIG_TARGET_DEVICE_${PLATFORM_DIR}_ipq60xx_DEVICE" .config || {
+            echo "错误：未启用任何IPQ60xx设备"
+            exit 1
+          }
 
-      - name: 编译固件（捕获错误）
+      - name: 编译固件（带错误捕获）
         run: |
           cd openwrt
-          # 编译并检查返回码
           if ! make -j1 V=s 2>&1 | tee compile.log; then
-            echo "=== 编译错误，最后100行日志 ==="
+            echo "=== 编译错误最后100行 ==="
             tail -n 100 compile.log
             exit 1
           fi
 
-      - name: 扩展搜索固件（核心修复）
+      - name: 全局搜索固件（不依赖路径）
         run: |
-          cd openwrt/bin/targets/qualcommax/ipq60xx
-          echo "=== 查看输出目录所有文件 ==="
-          ls -l
+          cd openwrt
+          # 从bin目录全局搜索IPQ6000相关固件
+          FIRMWARE_FILE=$(find bin/ -name "*.bin" | grep -i "ipq6000" | grep -i "m2" | head -n1)
           
-          # 扩展搜索模式（不严格匹配设备名，避免命名差异）
-          FIRMWARE_FILE=$(find . -name "*.bin" | grep -i "ipq6000.*m2" | head -n1)
           if [ -z "$FIRMWARE_FILE" ]; then
-            echo "=== 未找到目标固件，尝试搜索所有bin文件 ==="
-            find . -name "*.bin"
+            echo "=== 未找到固件，bin目录所有文件 ==="
+            find bin/ -name "*.bin"
             exit 1
           fi
+          
           echo "=== 找到固件：$FIRMWARE_FILE ==="
+          # 复制到易于访问的路径
+          cp "$FIRMWARE_FILE" ./zn-m2-ipq6000-firmware.bin
 
       - name: 上传固件和日志
         uses: actions/upload-artifact@v4
         with:
-          name: zn-m2-ipq6000-firmware
+          name: zn-m2-ipq6000-final
           path: |
-            openwrt/bin/targets/qualcommax/ipq60xx/*.bin
+            openwrt/zn-m2-ipq6000-firmware.bin
             openwrt/compile.log
           retention-days: 14
     
